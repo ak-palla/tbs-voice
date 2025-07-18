@@ -1,0 +1,5 @@
+/* Override Radix ScrollArea unwanted table layout */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+  min-width: auto !important;
+} 

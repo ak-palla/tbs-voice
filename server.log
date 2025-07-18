@@ -1,0 +1,27 @@
+
+> dev
+> node server.js
+
+[dotenv@17.0.0] injecting env (22) from .env.local – 🔐 encrypt with dotenvx: https://dotenvx.com
+🔑 [ENV] API Keys Status:
+🔑 [ENV] DEEPGRAM_API_KEY: e4b68508...
+🔑 [ENV] GEMINI_API_KEY: AIzaSyDm...
+🔑 [ENV] GROQ_API_KEY: gsk_43pL...
+ ⨯ uncaughtException: Error: listen EADDRINUSE: address already in use :::3000
+    at <unknown> (Error: listen EADDRINUSE: address already in use :::3000)
+    at <unknown> (C:\Users\NJ-25\Documents\tbs-main\server.js:324:14) {
+  code: 'EADDRINUSE',
+  errno: -4091,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+ ⨯ uncaughtException:  Error: listen EADDRINUSE: address already in use :::3000
+    at <unknown> (Error: listen EADDRINUSE: address already in use :::3000)
+    at <unknown> (C:\Users\NJ-25\Documents\tbs-main\server.js:324:14) {
+  code: 'EADDRINUSE',
+  errno: -4091,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}

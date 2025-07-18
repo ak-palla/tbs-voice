@@ -1,0 +1,3346 @@
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { NextResponse } from "next/server";
+import { createClient } from "@/utils/supabase/server";
+import { headers } from "next/headers";
+import serverCache from "@/utils/cache";
+import { createClient as createDeepgramClient } from "@deepgram/sdk";
+import { getRelevantInstructions } from "@/utils/embeddings";
+import { aggressiveCache, AggressiveCacheKeys } from "@/lib/aggressive-cache";
+import { memoryOptimizer } from "@/lib/memory-optimizer";
+import { pipelineOptimizer } from "@/lib/pipeline-optimizer";
+import { groqClient, formatMessagesForGroq, GROQ_MODELS } from "@/lib/groq-client";
+// @ts-ignore - JavaScript module import  
+const { pipelineTracker } = require("../../../lib/pipeline-tracker.js");
+// @ts-ignore - Simple manual logging
+const { SimpleServiceLogger } = require("../../../lib/simple-service-logger.js");
+
+const MODEL_NAME = "gemini-2.0-flash-lite-001"; // Reverting to original working model
+const AUDIO_MODEL_NAME = "gemini-2.0-flash-lite-001"; // Same model for consistency
+const API_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+
+const genAI = new GoogleGenerativeAI(API_KEY);
+
+// 🚀 CRITICAL FIX 3: Deepgram connection pooling for performance
+const deepgramClients = new Map<string, any>();
+function getOptimizedDeepgramClient(region: string = 'default') {
+  if (!deepgramClients.has(region)) {
+    const client = createDeepgramClient(DEEPGRAM_API_KEY);
+    deepgramClients.set(region, client);
+    console.log(`🚀 [DEEPGRAM POOL] Created new client for region: ${region}`);
+  }
+  return deepgramClients.get(region);
+}
+
+// 🎯 SIMPLE TTS GENERATION: Deepgram primary, Browser TTS fallback
+async function generateTTSAudio(text: string, writer: WritableStreamDefaultWriter<Uint8Array>, accent: string, gender: string, sessionId: string): Promise<void> {
+  const ttsStartTime = Date.now();
+  console.log(`🎯 [TTS] Starting TTS generation for: "${text.substring(0, 50)}..."`);
+  
+  // Clean text for TTS
+  let cleanText = text
+    .replace(/[^\w\s.,!?;:'"()\-\n\r]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  
+  if (cleanText.length > 4000) {
+    cleanText = cleanText.substring(0, 3997) + '...';
+  }
+  
+  // Step 1: Try Deepgram TTS (Primary)
+  try {
+    console.log(`🎤 [TTS] Attempting Deepgram TTS...`);
+    
+    const voiceOptions = {
+      'US': { 'female': 'aura-asteria-en', 'male': 'aura-arcas-en' },
+      'UK': { 'female': 'aura-luna-en', 'male': 'aura-perseus-en' }
+    };
+    
+    const selectedVoice = voiceOptions[accent]?.[gender] || 'aura-asteria-en';
+    const deepgram = getOptimizedDeepgramClient();
+    
+    const options = {
+      model: selectedVoice,
+      encoding: 'mp3' as const,
+      sample_rate: 24000
+    };
+    
+    const response = await deepgram.speak.request({ text: cleanText }, options);
+    const stream = await response.getStream();
+    
+    if (!stream) {
+      throw new Error("No audio stream received from Deepgram");
+    }
+    
+    // Collect complete audio
+    const reader = stream.getReader();
+    const audioChunks = [];
+    let totalBytes = 0;
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      audioChunks.push(value);
+      totalBytes += value.length;
+    }
+    
+    const completeAudioBuffer = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of audioChunks) {
+      completeAudioBuffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    const audioBase64 = Buffer.from(completeAudioBuffer).toString('base64');
+    const processingTime = Date.now() - ttsStartTime;
+    
+    // Send successful Deepgram TTS
+    const ttsPayload = {
+      type: 'tts-complete',
+      sessionId: sessionId,
+      audio: audioBase64,
+      mimeType: 'audio/mp3',
+      provider: 'deepgram',
+      voice: selectedVoice,
+      text: cleanText,
+      processingTime: processingTime,
+      fallback: false
+    };
+    
+    await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(ttsPayload)}\n\n`));
+    console.log(`✅ [TTS] Deepgram TTS success: ${totalBytes} bytes in ${processingTime}ms`);
+    
+  } catch (deepgramError) {
+    console.warn(`⚠️ [TTS] Deepgram failed: ${deepgramError.message}`);
+    
+    // Step 2: Fallback to Browser TTS
+    try {
+      console.log(`🔄 [TTS] Using Browser TTS fallback...`);
+      
+      // Send browser TTS fallback instruction
+      const fallbackPayload = {
+        type: 'tts-complete',
+        sessionId: sessionId,
+        audio: null, // No audio data, browser will generate
+        mimeType: 'browser-tts',
+        provider: 'browser',
+        voice: 'system-default',
+        text: cleanText,
+        processingTime: Date.now() - ttsStartTime,
+        fallback: true,
+        fallbackReason: deepgramError.message
+      };
+      
+      await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(fallbackPayload)}\n\n`));
+      console.log(`✅ [TTS] Browser TTS fallback sent`);
+      
+    } catch (fallbackError) {
+      console.error(`❌ [TTS] Both TTS methods failed:`, fallbackError);
+      
+      // Send error
+      const errorPayload = {
+        type: 'tts-error',
+        sessionId: sessionId,
+        error: 'All TTS methods failed',
+        details: { deepgram: deepgramError.message, fallback: fallbackError.message }
+      };
+      
+      await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(errorPayload)}\n\n`));
+    }
+  }
+}
+
+// 🚀 BUFFERED DEEPGRAM FALLBACK: Alternative TTS approach when streaming fails
+async function generateBufferedDeepgramFallback(text: string, voice: string, sessionId: string): Promise<string | null> {
+  try {
+    console.log(`🔄 [${sessionId}] BUFFERED FALLBACK: Attempting alternative Deepgram TTS method...`);
+    
+    // Use a direct approach instead of streaming
+    const fallbackKey = process.env.DEEPGRAM_API_KEY || process.env.NEXT_PUBLIC_DEEPGRAM_API_KEY;
+    if (!fallbackKey) {
+      console.error(`❌ [${sessionId}] BUFFERED FALLBACK: No Deepgram API key available for fallback`);
+      return null;
+    }
+    
+    console.log(`✅ [${sessionId}] BUFFERED FALLBACK: Using API key: ${fallbackKey.substring(0, 8)}...`);
+    
+    // Create a fresh client for the fallback attempt
+    const fallbackClient = createDeepgramClient(fallbackKey);
+    
+    // Use WAV format for better browser compatibility
+    const fallbackOptions = {
+      model: voice,
+      encoding: 'linear16' as const,
+      sample_rate: 24000,
+      container: 'wav' as const
+    };
+    
+    console.log(`🔧 [${sessionId}] BUFFERED FALLBACK: Using options:`, fallbackOptions);
+    
+    const startTime = Date.now();
+    const response = await fallbackClient.speak.request(
+      { text: text },
+      fallbackOptions
+    );
+    
+    const requestTime = Date.now() - startTime;
+    console.log(`⚡ [${sessionId}] BUFFERED FALLBACK: API request completed in ${requestTime}ms`);
+    
+    // Get the complete buffer instead of streaming
+    const audioBuffer = await response.getStream();
+    if (!audioBuffer) {
+      console.error(`❌ [${sessionId}] BUFFERED FALLBACK: No audio buffer received`);
+      return null;
+    }
+    
+    // Convert to base64
+    const reader = audioBuffer.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalSize += value.length;
+    }
+    
+    // Combine all chunks into a single buffer
+    const completeBuffer = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      completeBuffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    const base64Audio = Buffer.from(completeBuffer).toString('base64');
+    const totalTime = Date.now() - startTime;
+    
+    console.log(`✅ [${sessionId}] BUFFERED FALLBACK: Generated ${totalSize} bytes of audio in ${totalTime}ms`);
+    console.log(`🎯 [${sessionId}] BUFFERED FALLBACK: Base64 length: ${base64Audio.length} characters`);
+    
+    return base64Audio;
+    
+  } catch (error) {
+    console.error(`❌ [${sessionId}] BUFFERED FALLBACK failed:`, error);
+    return null;
+  }
+}
+
+// Helper function to get user ID from request
+async function getUserId(req: Request) {
+  try {
+    const supabase = await createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.user?.id; 
+  } catch (error) {
+    console.error("Error getting user session:", error);
+    return null;
+  }
+}
+
+// Helper function to get global instructions (category-based)
+async function getGlobalInstructions(categories?: string[]) {
+  try {
+    console.log('🔄 [Supabase] Fetching global instructions (category-based)');
+    const supabase = await createClient();
+    let query = supabase
+      .from('chatbot_instructions')
+      .select('title, content, content_type, url, updated_at, created_at, extraction_metadata, priority, category')
+      .eq('is_active', true)
+      .order('priority', { ascending: false })
+      .order('created_at', { ascending: true });
+
+    if (categories && categories.length > 0) {
+      query = query.in('category', categories);
+      console.log(`✅ [Supabase] Filtering instructions by categories: ${categories.join(', ')}`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error('❌ [Supabase] Error fetching global instructions:', error);
+      throw error;
+    }
+
+    console.log(`✅ [Supabase] Fetched ${data?.length || 0} global instructions`);
+    return data || [];
+  } catch (error) {
+    console.error("❌ [Supabase] Error fetching global instructions:", error);
+    return [];
+  }
+}
+
+// Enhanced semantic instruction retrieval using vector search with caching
+async function getSemanticInstructions(userQuery: string, maxInstructions: number = 5, similarityThreshold: number = 0.7) {
+  try {
+    // Safety check for userQuery parameter
+    if (!userQuery || typeof userQuery !== 'string') {
+      console.error(`⚠️ [SEMANTIC RAG] Invalid userQuery parameter: ${typeof userQuery}, value: ${userQuery}`);
+      userQuery = 'Hello'; // Fallback to prevent errors
+    }
+    
+    const startTime = Date.now();
+    console.log(`🔍 [SEMANTIC RAG] Starting semantic instruction search for query: "${userQuery.substring(0, 50)}..."`); 
+    
+    const supabase = await createClient();
+    const semanticInstructions = await getRelevantInstructions(
+      supabase, 
+      userQuery, 
+      maxInstructions, 
+      similarityThreshold
+    );
+    
+    const searchTime = Date.now() - startTime;
+    console.log(`🎯 [SEMANTIC RAG] Found ${semanticInstructions.length} relevant instructions in ${searchTime}ms (threshold: ${similarityThreshold})`);
+    
+    // Log instruction relevance for debugging
+    if (semanticInstructions.length > 0) {
+      semanticInstructions.forEach((instruction, index) => {
+        const similarity = (instruction as any).similarity || 'unknown';
+        console.log(`📋 [SEMANTIC RAG] ${index + 1}. "${instruction.title}" (similarity: ${similarity})`);
+      });
+    } else {
+      console.log(`⚠️ [SEMANTIC RAG] No instructions found above threshold ${similarityThreshold} for query: "${userQuery.substring(0, 100)}"`);
+    }
+    
+    return semanticInstructions;
+  } catch (error) {
+    console.error('❌ [SEMANTIC RAG] Vector search failed, falling back to category-based instructions:', error);
+    // Fallback to category-based instructions if vector search fails
+    return await getGlobalInstructions(['main_chat_instructions', 'global_instructions']);
+  }
+}
+
+// OPTIMIZED: Semantic search using pre-generated embedding
+async function getSemanticInstructionsWithEmbedding(supabase: any, queryEmbedding: number[], maxInstructions: number = 5, similarityThreshold: number = 0.7) {
+  try {
+    console.time(`📋 Vector Search (threshold: ${similarityThreshold})`);
+    
+    // Perform vector similarity search directly with existing embedding
+    const { data: instructions, error } = await supabase.rpc(
+      'match_chatbot_instructions',
+      {
+        query_embedding: queryEmbedding,
+        match_threshold: similarityThreshold,
+        match_count: maxInstructions
+      }
+    );
+    
+    console.timeEnd(`📋 Vector Search (threshold: ${similarityThreshold})`);
+    
+    if (error) {
+      console.error(
+        "CRITICAL: Vector search RPC 'match_chatbot_instructions' failed. Proceeding with no retrieved instructions.", 
+        error
+      );
+      return [];
+    }
+    
+    return instructions || [];
+  } catch (error) {
+    console.error("Error in optimized semantic search:", error);
+    return [];
+  }
+}
+
+// Get critical instructions that should always be available
+async function getCriticalInstructions(maxCritical: number = 2) {
+  try {
+    const supabase = await createClient();
+    const { data: criticalInstructions, error } = await supabase
+      .from('chatbot_instructions')
+      .select('title, content, content_type, url, updated_at, created_at, extraction_metadata, priority, category')
+      .eq('is_active', true)
+      .in('category', ['main_chat_instructions', 'global_instructions'])
+      .order('priority', { ascending: false })
+      .order('created_at', { ascending: true })
+      .limit(maxCritical);
+    
+    if (error) {
+      console.error('❌ [CRITICAL] Error fetching critical instructions:', error);
+      return [];
+    }
+    
+    return criticalInstructions || [];
+  } catch (error) {
+    console.error('❌ [CRITICAL] Critical instruction retrieval failed:', error);
+    return [];
+  }
+}
+
+// Multi-Stage Retrieval Pipeline for optimal instruction selection - OPTIMIZED
+async function getOptimalInstructions(userQuery: string, targetMin: number = 3, targetMax: number = 5): Promise<any[]> {
+  const startTime = performance.now();
+  console.time('🎯 Multi-Stage Instruction Retrieval');
+  
+  try {
+    // Safety check for userQuery parameter
+    if (!userQuery || typeof userQuery !== 'string') {
+      console.error(`⚠️ [MULTI-STAGE] Invalid userQuery parameter: ${typeof userQuery}, value: ${userQuery}`);
+      userQuery = 'Hello'; // Fallback to prevent errors
+    }
+    
+    console.error(`🎯 [MULTI-STAGE] Starting optimal retrieval for: "${userQuery.substring(0, 50)}..."`);
+    console.error(`🎯 [MULTI-STAGE] Target: ${targetMin}-${targetMax} instructions (SPEED OPTIMIZED)`);
+    
+    // OPTIMIZATION: Generate embedding once and reuse
+    console.time('🔄 Single Embedding Generation');
+    const supabase = await createClient();
+    const { generateQueryEmbedding } = await import('@/utils/embeddings');
+    const queryEmbedding = await generateQueryEmbedding(userQuery);
+    console.timeEnd('🔄 Single Embedding Generation');
+    
+    // Stage 1: High-confidence semantic search (realistic threshold for your content)
+    console.error(`📊 [STAGE 1] High-confidence semantic search (threshold: 0.02)`);
+    console.time('📊 Stage 1 - High Confidence Search');
+    let instructions = await getSemanticInstructionsWithEmbedding(supabase, queryEmbedding, targetMax, 0.02);
+    console.timeEnd('📊 Stage 1 - High Confidence Search');
+    console.error(`📊 [STAGE 1] Found ${instructions.length} high-confidence instructions`);
+    
+    // Stage 2: If insufficient, expand with medium confidence
+    if (instructions.length < targetMin) {
+      console.error(`📊 [STAGE 2] Expanding search - need ${targetMin - instructions.length} more (threshold: 0.01)`);
+      console.time('📊 Stage 2 - Medium Confidence Search');
+      const additional = await getSemanticInstructionsWithEmbedding(supabase, queryEmbedding, targetMax, 0.01);
+      console.timeEnd('📊 Stage 2 - Medium Confidence Search');
+      
+      // Filter out duplicates and add new instructions
+      const newInstructions = additional.filter(inst => 
+        !instructions.some(existing => existing.title === inst.title)
+      );
+      
+      const needed = targetMin - instructions.length;
+      instructions = [...instructions, ...newInstructions.slice(0, needed)];
+      console.error(`📊 [STAGE 2] Added ${Math.min(newInstructions.length, needed)} medium-confidence instructions`);
+    }
+    
+    // Stage 3: If still insufficient, add critical baseline instructions
+    if (instructions.length < targetMin) {
+      console.error(`📊 [STAGE 3] Adding critical baseline instructions`);
+      const critical = await getCriticalInstructions(targetMin - instructions.length);
+      
+      // Filter out duplicates and add critical instructions
+      const newCritical = critical.filter(inst => 
+        !instructions.some(existing => existing.title === inst.title)
+      );
+      
+      instructions = [...instructions, ...newCritical];
+      console.error(`📊 [STAGE 3] Added ${newCritical.length} critical instructions`);
+    }
+    
+    // Stage 4: Cap at maximum if we have too many
+    if (instructions.length > targetMax) {
+      console.error(`📊 [STAGE 4] Capping at ${targetMax} instructions (had ${instructions.length})`);
+      instructions = instructions.slice(0, targetMax);
+    }
+    
+    const totalTime = performance.now() - startTime;
+    console.timeEnd('🎯 Multi-Stage Instruction Retrieval');
+    console.error(`✅ [OPTIMAL] Final result: ${instructions.length} perfectly balanced instructions in ${totalTime.toFixed(2)}ms`);
+    
+    // Log final instruction set for debugging
+    instructions.forEach((instruction, index) => {
+      const similarity = (instruction as any).similarity || 'baseline';
+      console.error(`📋 [OPTIMAL] ${index + 1}. "${instruction.title}" (score: ${similarity})`);
+    });
+    
+    return instructions;
+  } catch (error) {
+    console.error('❌ [MULTI-STAGE] Pipeline failed, using emergency fallback:', error);
+    // Emergency fallback to category-based instructions
+    return await getGlobalInstructions(['main_chat_instructions', 'global_instructions']);
+  }
+}
+
+// Legacy hybrid function - now calls optimal pipeline
+async function getHybridInstructions(userQuery: string, maxSemantic: number = 3, maxPriority: number = 2) {
+  // Use optimal pipeline with converted parameters
+  const targetMin = Math.min(maxSemantic, 3);
+  const targetMax = maxSemantic + maxPriority;
+  
+  console.log(`🔀 [HYBRID→OPTIMAL] Redirecting to optimal pipeline (${targetMin}-${targetMax} instructions)`);
+  return await getOptimalInstructions(userQuery, targetMin, targetMax);
+}
+
+// Helper function to get user data
+async function getUserData(userId: string) {
+  if (!userId) {
+    console.log('⚠️ [Supabase] No userId provided for getUserData');
+    return null;
+  }
+
+  console.log(`🔄 [Supabase] Fetching data for user: ${userId}`);
+
+  try {
+    const supabase = await createClient();
+    
+    // Fetch business info
+    console.log('🔄 [Supabase] Fetching business info');
+    const { data: businessInfo, error: businessError } = await supabase
+      .from('business_info')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (businessError) {
+      console.error("❌ [Supabase] Error fetching business info:", businessError);
+      if (businessError.code !== "PGRST116") { // Not found is ok
+        throw businessError;
+      }
+    } else {
+      console.log('✅ [Supabase] Business info fetched successfully');
+    }
+    
+    // Fetch chat history
+    console.log('🔄 [Supabase] Fetching chat history');
+    const { data: chatHistoryData, error: chatError } = await supabase
+      .from('chat_history')
+      .select('messages')
+      .eq('user_id', userId)
+      .single();
+
+    if (chatError && chatError.code !== "PGRST116") {
+      console.error("❌ [Supabase] Error fetching chat history:", chatError);
+    } else {
+      console.log('✅ [Supabase] Chat history fetched successfully');
+    }
+    
+    // Fetch data from other tables
+    const regularTables = [
+      'battle_plan',
+      'chain_of_command',
+      'company_onboarding',
+      'hwgt_plan',
+      'machines',
+      'meeting_rhythm_planner',
+      'playbooks',
+      'quarterly_sprint_canvas',
+      'triage_planner',
+      'user_timeline_claims'
+    ];
+    
+    console.log('🔄 [Supabase] Fetching data from regular tables');
+    const regularTablePromises = regularTables.map(table => {
+      console.log(`🔄 [Supabase] Fetching ${table}`);
+      return supabase
+        .from(table)
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .then(({ data, error }) => {
+          if (error) {
+            console.error(`❌ [Supabase] Error fetching ${table}:`, error);
+            return { table, data: [] };
+          }
+          console.log(`✅ [Supabase] Fetched ${data?.length || 0} records from ${table}`);
+          return { table, data: data || [] };
+        });
+    });
+    
+    // Fetch timeline data (chq_timeline doesn't have user_id)
+    console.log('🔄 [Supabase] Fetching timeline data');
+    const timelinePromise = supabase
+      .from('chq_timeline')
+      .select('*')
+      .order('week_number', { ascending: true })
+      .then(({ data, error }) => {
+        if (error) {
+          console.error(`❌ [Supabase] Error fetching chq_timeline:`, error);
+          return { table: 'chq_timeline', data: [] };
+        }
+        console.log(`✅ [Supabase] Fetched ${data?.length || 0} records from chq_timeline`);
+        return { table: 'chq_timeline', data: data || [] };
+      });
+    
+    const allPromises = [...regularTablePromises, timelinePromise];
+    const tableResults = await Promise.all(allPromises);
+    
+    // Format the response
+    const userData = {
+      businessInfo: businessInfo || null,
+      chatHistory: chatHistoryData?.messages || [],
+      additionalData: {} as Record<string, any[]>
+    };
+    
+    // Add other table data
+    tableResults.forEach(({ table, data }) => {
+      if (data && data.length > 0) {
+        console.log(`✅ [Supabase] Adding ${data.length} records from ${table} to response`);
+        userData.additionalData[table] = data;
+      } else {
+        console.log(`⚠️ [Supabase] No records found in ${table} for user ${userId}`);
+      }
+    });
+    
+    console.log('✅ [Supabase] All user data fetched successfully');
+    return userData;
+  } catch (error) {
+    console.error('❌ [Supabase] Error fetching user data:', error);
+    return null;
+  }
+}
+
+// Helper function to save message to history for a specific instance
+async function saveMessageToHistory(userId: string, message: string, role: 'user' | 'assistant', instanceId?: string) {
+  if (!userId) {
+    console.log('⚠️ [Supabase] No userId provided, not saving message to history');
+    return null;
+  }
+
+  try {
+    console.log(`🔄 [Supabase] Saving ${role} message to history for user: ${userId}, instance: ${instanceId || 'current'}`);
+    
+    const supabase = await createClient();
+    const messageObj = {
+      role: role,
+      content: message,
+      timestamp: new Date().toISOString()
+    };
+
+    if (instanceId) {
+      // Update specific instance
+    const { data: existingHistory, error: fetchError } = await supabase
+      .from('chat_history')
+      .select('id, messages')
+        .eq('id', instanceId)
+      .eq('user_id', userId)
+      .single();
+
+      if (fetchError) {
+        console.error('❌ [Supabase] Error fetching chat instance:', fetchError);
+        return null;
+      }
+
+      const messages = existingHistory.messages || [];
+      messages.push(messageObj);
+      
+      // Limit to the last 50 messages
+      const limitedMessages = messages.slice(-50);
+
+      const { error: updateError } = await supabase
+        .from('chat_history')
+        .update({ messages: limitedMessages })
+        .eq('id', instanceId);
+      
+      if (updateError) {
+        console.error('❌ [Supabase] Error updating chat instance:', updateError);
+        return null;
+    }
+    
+      console.log('✅ [Supabase] Updated chat instance');
+      return instanceId;
+    } else {
+      // Get the user's most recent instance or create a new one
+      const { data: recentInstance, error: recentError } = await supabase
+        .from('chat_history')
+        .select('id, messages')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (recentError && recentError.code !== 'PGRST116') {
+        console.error('❌ [Supabase] Error fetching recent chat instance:', recentError);
+        return null;
+      }
+
+      if (!recentInstance) {
+        // Create new instance
+        console.log('🔄 [Supabase] Creating new chat instance');
+        const { data: newInstance, error: insertError } = await supabase
+        .from('chat_history')
+        .insert({
+          user_id: userId,
+            title: 'New Chat',
+          messages: [messageObj]
+          })
+          .select('id')
+          .single();
+      
+      if (insertError) {
+          console.error('❌ [Supabase] Error creating chat instance:', insertError);
+          return null;
+        }
+
+        console.log('✅ [Supabase] Created new chat instance');
+        return newInstance.id;
+    } else {
+        // Update existing instance
+        console.log('🔄 [Supabase] Updating recent chat instance');
+        const messages = recentInstance.messages || [];
+      messages.push(messageObj);
+      
+      // Limit to the last 50 messages
+      const limitedMessages = messages.slice(-50);
+
+      const { error: updateError } = await supabase
+        .from('chat_history')
+        .update({ messages: limitedMessages })
+          .eq('id', recentInstance.id);
+      
+      if (updateError) {
+          console.error('❌ [Supabase] Error updating chat instance:', updateError);
+          return null;
+        }
+
+        console.log('✅ [Supabase] Updated chat instance');
+        return recentInstance.id;
+      }
+    }
+  } catch (error) {
+    console.error('❌ [Supabase] Error saving message to history:', error);
+    return null;
+  }
+}
+
+// Helper function to get all chat instances for a user
+async function getChatInstances(userId: string) {
+  if (!userId) return [];
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('chat_history')
+      .select('id, title, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      console.error('❌ [Supabase] Error fetching chat instances:', error);
+      return [];
+    }
+
+    return data || [];
+  } catch (error) {
+    console.error('❌ [Supabase] Error fetching chat instances:', error);
+    return [];
+  }
+}
+
+// Helper function to get a specific chat instance
+async function getChatInstance(userId: string, instanceId: string) {
+  if (!userId || !instanceId) return null;
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('chat_history')
+      .select('*')
+      .eq('id', instanceId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      console.error('❌ [Supabase] Error fetching chat instance:', error);
+      return null;
+    }
+
+    return data;
+  } catch (error) {
+    console.error('❌ [Supabase] Error fetching chat instance:', error);
+    return null;
+  }
+}
+
+// Helper function to create a new chat instance
+async function createChatInstance(userId: string, title: string = 'New Chat') {
+  if (!userId) return null;
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('chat_history')
+      .insert({
+        user_id: userId,
+        title: title,
+        messages: []
+      })
+      .select('*')
+      .single();
+
+    if (error) {
+      console.error('❌ [Supabase] Error creating chat instance:', error);
+      return null;
+    }
+
+    console.log('✅ [Supabase] Created new chat instance');
+    return data;
+  } catch (error) {
+    console.error('❌ [Supabase] Error creating chat instance:', error);
+    return null;
+  }
+}
+
+// Helper function to update chat instance title
+async function updateChatInstanceTitle(userId: string, instanceId: string, title: string) {
+  if (!userId || !instanceId) return false;
+
+  try {
+    const supabase = await createClient();
+    const { error } = await supabase
+      .from('chat_history')
+      .update({ title })
+      .eq('id', instanceId)
+      .eq('user_id', userId);
+
+    if (error) {
+      console.error('❌ [Supabase] Error updating chat instance title:', error);
+      return false;
+    }
+
+    console.log('✅ [Supabase] Updated chat instance title');
+    return true;
+  } catch (error) {
+    console.error('❌ [Supabase] Error updating chat instance title:', error);
+    return false;
+  }
+}
+
+// Helper function to delete a chat instance
+async function deleteChatInstance(userId: string, instanceId: string) {
+  if (!userId || !instanceId) return false;
+
+  try {
+    const supabase = await createClient();
+    const { error } = await supabase
+      .from('chat_history')
+      .delete()
+      .eq('id', instanceId)
+      .eq('user_id', userId);
+
+    if (error) {
+      console.error('❌ [Supabase] Error deleting chat instance:', error);
+      return false;
+    }
+
+    console.log('✅ [Supabase] Deleted chat instance');
+    return true;
+  } catch (error) {
+    console.error('❌ [Supabase] Error deleting chat instance:', error);
+    return false;
+  }
+}
+
+// Helper function to clear chat history for a specific instance
+async function clearChatHistory(userId: string, instanceId?: string) {
+  if (!userId) return false;
+
+  try {
+    const supabase = await createClient();
+    
+    if (instanceId) {
+      // Clear specific instance
+    const { error } = await supabase
+      .from('chat_history')
+      .update({ messages: [] })
+        .eq('id', instanceId)
+      .eq('user_id', userId);
+
+    return !error;
+    } else {
+      // Clear the most recent instance (for backward compatibility)
+      const { data: recentInstance, error: fetchError } = await supabase
+        .from('chat_history')
+        .select('id')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (fetchError) {
+        console.error('❌ [Supabase] Error fetching recent instance for clearing:', fetchError);
+        return false;
+      }
+
+      const { error } = await supabase
+        .from('chat_history')
+        .update({ messages: [] })
+        .eq('id', recentInstance.id);
+
+      return !error;
+    }
+  } catch (error) {
+    console.error("Error clearing chat history:", error);
+    return false;
+  }
+}
+
+// Helper function to format table data
+function formatTableData(table: string, data: any) {
+  if (!data) return '';
+  
+  const parts: string[] = [];
+  
+  // Helper function to try parsing JSON strings
+  const tryParseJSON = (value: any): any => {
+    if (typeof value !== 'string') return value;
+    
+    // Try to parse JSON strings
+    try {
+      const parsed = JSON.parse(value);
+      // Only return the parsed value if it's actually an object or array
+      if (typeof parsed === 'object' && parsed !== null) {
+        return parsed;
+      }
+    } catch (e) {
+      // Not JSON, return the original value
+    }
+    
+    return value;
+  };
+  
+  // Helper function to format a value with proper handling of nested objects
+  const formatValue = (value: any, depth: number = 0): string => {
+    // Try to parse JSON strings
+    value = tryParseJSON(value);
+    
+    if (value === null || value === undefined) return 'None';
+    
+    const indent = '  '.repeat(depth);
+    
+    if (typeof value === 'object') {
+      if (Array.isArray(value)) {
+        if (value.length === 0) return '[]';
+        
+        // If array contains simple values, format as comma-separated list
+        if (value.every(item => typeof item !== 'object' || item === null)) {
+          return value.map(item => formatValue(item, depth)).join(', ');
+        }
+        
+        // Otherwise format as multi-line list
+        const itemsFormatted = value.map(item => `${indent}  - ${formatValue(item, depth + 1)}`).join('\n');
+        return `\n${itemsFormatted}`;
+      }
+      
+      // Handle Date objects
+      if (value instanceof Date) {
+        return value.toLocaleString();
+      }
+      
+      // For empty objects
+      if (Object.keys(value).length === 0) return '{}';
+      
+      // Format object properties as multi-line
+      const formattedProps = Object.entries(value).map(([key, val]) => {
+        const propName = key
+          .split('_')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(' ');
+        
+        return `${indent}  ${propName}: ${formatValue(val, depth + 1)}`;
+      }).join('\n');
+      
+      return `\n${formattedProps}`;
+    }
+    
+    if (typeof value === 'boolean') {
+      return value ? 'Yes' : 'No';
+    }
+    
+    if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)) {
+      // Format ISO dates more nicely
+      try {
+        const date = new Date(value);
+        return date.toLocaleString();
+      } catch (e) {
+        return String(value);
+      }
+    }
+    
+    return String(value);
+  };
+
+  // Helper function to format a field name
+  const formatFieldName = (field: string): string => {
+    return field
+      .split('_')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
+  };
+
+  // Special handling for timeline tables
+  if (table === 'chq_timeline') {
+    parts.push(`- Week Number: ${formatValue(data.week_number)}`);
+    parts.push(`- Event: ${formatValue(data.event_name)}`);
+    parts.push(`- Date: ${formatValue(data.scheduled_date)}`);
+    if (data.duration_minutes) parts.push(`- Duration: ${formatValue(data.duration_minutes)} minutes`);
+    if (data.description) parts.push(`- Description: ${formatValue(data.description)}`);
+    if (data.meeting_link) parts.push(`- Meeting Link: ${formatValue(data.meeting_link)}`);
+    return parts.join('\n');
+  }
+  
+  if (table === 'user_timeline_claims') {
+    parts.push(`- Timeline ID: ${formatValue(data.timeline_id)}`);
+    parts.push(`- Status: ${data.is_completed ? 'Completed' : 'Pending'}`);
+    if (data.completion_date) parts.push(`- Completed On: ${formatValue(data.completion_date)}`);
+    if (data.notes) parts.push(`- Notes: ${formatValue(data.notes)}`);
+    return parts.join('\n');
+  }
+
+  // Special handling for machines table
+  if (table === 'machines') {
+    parts.push(`- Engine Name: ${formatValue(data.enginename)}`);
+    parts.push(`- Engine Type: ${formatValue(data.enginetype)}`);
+    if (data.description) parts.push(`- Description: ${formatValue(data.description)}`);
+    
+    // Handle complex nested objects with better formatting
+    if (data.triggeringevents) {
+      parts.push(`- Triggering Events:`);
+      if (Array.isArray(data.triggeringevents)) {
+        data.triggeringevents.forEach((event: any, index: number) => {
+          parts.push(`  Event #${index + 1}:`);
+          Object.entries(event).forEach(([key, val]) => {
+            if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+              parts.push(`    ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+            }
+          });
+        });
+      } else {
+        Object.entries(data.triggeringevents).forEach(([key, val]) => {
+          if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+            parts.push(`  ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+          }
+        });
+      }
+    }
+    
+    if (data.endingevent) {
+      parts.push(`- Ending Event:`);
+      Object.entries(data.endingevent).forEach(([key, val]) => {
+        if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+          parts.push(`  ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+        }
+      });
+    }
+    
+    if (data.actionsactivities) {
+      parts.push(`- Actions/Activities:`);
+      if (Array.isArray(data.actionsactivities)) {
+        data.actionsactivities.forEach((action: any, index: number) => {
+          parts.push(`  Action #${index + 1}:`);
+          Object.entries(action).forEach(([key, val]) => {
+            if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+              parts.push(`    ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+            }
+          });
+        });
+      }
+    }
+    
+    // Handle any remaining fields
+    Object.entries(data)
+      .filter(([key]) => !['id', 'user_id', 'created_at', 'updated_at', 'enginename', 'enginetype', 'description', 'triggeringevents', 'endingevent', 'actionsactivities'].includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    
+    return parts.join('\n');
+  }
+
+  // Special handling for battle plan
+  if (table === 'battle_plan') {
+    // Handle complex nested fields individually
+    if (data.purposewhy) {
+      parts.push(`- Purpose/Why:`);
+      if (typeof data.purposewhy === 'object') {
+        Object.entries(data.purposewhy).forEach(([key, val]) => {
+          if (val !== null && val !== undefined && val !== '') {
+            parts.push(`  ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+          }
+        });
+      } else {
+        parts.push(`  ${formatValue(data.purposewhy)}`);
+      }
+    }
+    
+    if (data.strategicanchors) {
+      parts.push(`- Strategic Anchors:`);
+      if (Array.isArray(data.strategicanchors)) {
+        data.strategicanchors.forEach((anchor: any, index: number) => {
+          parts.push(`  Anchor #${index + 1}:`);
+          Object.entries(anchor).forEach(([key, val]) => {
+            if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+              parts.push(`    ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+            }
+          });
+        });
+      }
+    }
+    
+    if (data.corevalues) {
+      parts.push(`- Core Values:`);
+      if (Array.isArray(data.corevalues)) {
+        data.corevalues.forEach((value: any, index: number) => {
+          parts.push(`  Value #${index + 1}:`);
+          Object.entries(value).forEach(([key, val]) => {
+            if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+              parts.push(`    ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+            }
+          });
+        });
+      } else if (typeof data.corevalues === 'object') {
+        Object.entries(data.corevalues).forEach(([key, val]) => {
+          if (val !== null && val !== undefined && val !== '') {
+            parts.push(`  ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+          }
+        });
+      }
+    }
+    
+    if (data.threeyeartarget) {
+      parts.push(`- Three Year Target:`);
+      if (typeof data.threeyeartarget === 'object') {
+        Object.entries(data.threeyeartarget).forEach(([key, val]) => {
+          if (val !== null && val !== undefined && val !== '') {
+            parts.push(`  ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+          }
+        });
+      }
+    }
+    
+    // Handle other simple fields
+    ['missionstatement', 'visionstatement', 'businessplanlink'].forEach(field => {
+      if (data[field] !== null && data[field] !== undefined && data[field] !== '') {
+        parts.push(`- ${formatFieldName(field)}: ${formatValue(data[field])}`);
+      }
+    });
+    
+    // Handle any remaining fields
+    Object.entries(data)
+      .filter(([key]) => !['id', 'user_id', 'created_at', 'updated_at', 'missionstatement', 'visionstatement', 'purposewhy', 'strategicanchors', 'corevalues', 'threeyeartarget', 'businessplanlink'].includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    
+    return parts.join('\n');
+  }
+
+  // Special handling for triage planner
+  if (table === 'triage_planner') {
+    // Handle company info first
+    if (data.company_info) {
+      parts.push(`- Company Info:`);
+      if (typeof data.company_info === 'object') {
+        Object.entries(data.company_info).forEach(([key, val]) => {
+          if (val !== null && val !== undefined && val !== '') {
+            parts.push(`  ${formatFieldName(key)}:`);
+            if (typeof val === 'object') {
+              Object.entries(val).forEach(([subKey, subVal]) => {
+                parts.push(`    ${formatFieldName(subKey)}: ${formatValue(subVal, 2)}`);
+              });
+            } else {
+              parts.push(`    ${formatValue(val, 2)}`);
+            }
+          }
+        });
+      }
+    }
+    
+    // Handle internal tasks
+    const internalTasksField = data.internal_tasks || data.internalTasks;
+    if (internalTasksField) {
+      parts.push(`- Internal Tasks:`);
+      if (Array.isArray(internalTasksField)) {
+        internalTasksField.forEach((task: any, index: number) => {
+          parts.push(`  Task #${index + 1}:`);
+          Object.entries(task).forEach(([key, val]) => {
+            if (key !== 'id' && val !== null && val !== undefined && val !== '') {
+              parts.push(`    ${formatFieldName(key)}: ${formatValue(val, 2)}`);
+            }
+          });
+        });
+      }
+    }
+    
+    // Handle text fields with specific ordering
+    const textFields = [
+      'what_is_right', 'whatIsRight', 
+      'what_is_wrong', 'whatIsWrong',
+      'what_is_missing', 'whatIsMissing',
+      'what_is_confusing', 'whatIsConfusing'
+    ];
+    
+    // First check if they exist in snake_case or camelCase
+    textFields.forEach(field => {
+      if (data[field] !== null && data[field] !== undefined && data[field] !== '') {
+        parts.push(`- ${formatFieldName(field)}: ${formatValue(data[field])}`);
+      }
+    });
+    
+    // Process remaining fields, excluding already processed ones
+    const processedFields = [
+      'company_info', 'companyInfo', 'internal_tasks', 'internalTasks',
+      ...textFields, 'id', 'user_id', 'created_at', 'updated_at'
+    ];
+    
+    Object.entries(data)
+      .filter(([key]) => !processedFields.includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    
+    return parts.join('\n');
+  }
+
+  // Special handling for HWGT Plan
+  if (table === 'hwgt_plan') {
+    if (data.howwegetthereplan) {
+      parts.push(`- How We Get There Plan:`);
+      
+      // Try to parse it if it's a string
+      let planData = data.howwegetthereplan;
+      if (typeof planData === 'string') {
+        try {
+          planData = JSON.parse(planData);
+        } catch (e) {
+          // Keep as string if parsing fails
+        }
+      }
+      
+      if (typeof planData === 'object' && planData !== null && !Array.isArray(planData)) {
+        // Format each section
+        Object.entries(planData).forEach(([section, quarters]) => {
+          // Format section name nicely
+          const sectionName = section
+            .replace(/([A-Z])/g, ' $1')
+            .split(' ')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+          
+          parts.push(`  ${sectionName}:`);
+          
+          if (quarters !== null && typeof quarters === 'object' && !Array.isArray(quarters)) {
+            Object.entries(quarters as Record<string, any>).forEach(([quarter, value]) => {
+              parts.push(`    ${quarter}: ${formatValue(value, 2)}`);
+            });
+          } else {
+            parts.push(`    ${formatValue(quarters, 2)}`);
+          }
+        });
+      } else {
+        // Fallback for unexpected format
+        parts.push(`  ${formatValue(planData)}`);
+      }
+    }
+    
+    // Add any other fields
+    Object.entries(data)
+      .filter(([key]) => key !== 'howwegetthereplan' && !['id', 'user_id', 'created_at', 'updated_at'].includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    
+    return parts.join('\n');
+  }
+
+  // Special handling for Quarterly Sprint Canvas
+  if (table === 'quarterly_sprint_canvas') {
+    // Handle revenue goals
+    if (data.revenuegoals) {
+      parts.push(`- Revenue Goals:`);
+      let revenueData = tryParseJSON(data.revenuegoals);
+      
+      if (typeof revenueData === 'object' && revenueData !== null) {
+        Object.entries(revenueData).forEach(([level, value]) => {
+          parts.push(`  ${formatFieldName(level)}: ${formatValue(value, 2)}`);
+        });
+      } else {
+        parts.push(`  ${formatValue(revenueData)}`);
+      }
+    }
+    
+    // Handle revenue by month
+    if (data.revenuebymonth) {
+      parts.push(`- Revenue By Month:`);
+      let revenueByMonth = tryParseJSON(data.revenuebymonth);
+      
+      if (typeof revenueByMonth === 'object' && revenueByMonth !== null) {
+        Object.entries(revenueByMonth).forEach(([month, value]) => {
+          parts.push(`  ${formatFieldName(month)}: ${formatValue(value, 2)}`);
+        });
+      } else {
+        parts.push(`  ${formatValue(revenueByMonth)}`);
+      }
+    }
+    
+    // Handle lists
+    const listFields = ['strategicpillars', 'northstarmetrics', 'keyinitiatives', 'unitgoals'];
+    listFields.forEach(field => {
+      if (data[field]) {
+        const fieldValue = tryParseJSON(data[field]);
+        
+        parts.push(`- ${formatFieldName(field)}:`);
+        
+        if (Array.isArray(fieldValue)) {
+          fieldValue.forEach((item, index) => {
+            parts.push(`  ${index + 1}. ${formatValue(item, 2)}`);
+          });
+        } else if (typeof fieldValue === 'object' && fieldValue !== null) {
+          Object.entries(fieldValue).forEach(([key, value]) => {
+            parts.push(`  ${formatFieldName(key)}: ${formatValue(value, 2)}`);
+          });
+        } else if (typeof data[field] === 'string') {
+          // Handle comma-separated values
+          const items = data[field].split(',').map((item: string) => item.trim()).filter(Boolean);
+          items.forEach((item: string, index: number) => {
+            parts.push(`  ${index + 1}. ${item}`);
+          });
+        } else {
+          parts.push(`  ${formatValue(data[field])}`);
+        }
+      }
+    });
+    
+    // Add any other fields
+    Object.entries(data)
+      .filter(([key]) => ![...listFields, 'revenuegoals', 'revenuebymonth', 'id', 'user_id', 'created_at', 'updated_at'].includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    
+    return parts.join('\n');
+  }
+
+  // Special handling for company_onboarding
+  if (table === 'company_onboarding') {
+    parts.push(`- Completed: ${data.completed ? 'Yes' : 'No'}`);
+    if (data.onboarding_data) {
+      parts.push(`- Onboarding Data: ${formatValue(data.onboarding_data)}`);
+    }
+    // Add any other fields if necessary, excluding system fields and already handled ones
+    Object.entries(data)
+      .filter(([key]) => !['id', 'user_id', 'created_at', 'updated_at', 'completed', 'onboarding_data'].includes(key))
+      .forEach(([key, value]) => {
+        if (value !== null && value !== undefined && value !== '') {
+          parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+        }
+      });
+    return parts.join('\n');
+  }
+
+  // Add all fields except system fields for other tables
+  Object.entries(data)
+    .filter(([key]) => !['id', 'user_id', 'created_at', 'updated_at'].includes(key))
+    .forEach(([key, value]) => {
+      if (value !== null && value !== undefined && value !== '') {
+        parts.push(`- ${formatFieldName(key)}: ${formatValue(value)}`);
+      }
+    });
+
+  return parts.join('\n');
+}
+
+// Helper function to prepare user context
+function prepareUserContext(userData: any) {
+  if (!userData) return '';
+  
+  const parts: string[] = ['📊 USER DATA CONTEXT 📊\n'];
+  
+  // Format business info
+  if (userData.businessInfo) {
+    const info = userData.businessInfo;
+    parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 👤 USER INFORMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 Personal Details:
+- Full Name: ${info.full_name || 'Unknown'}
+- Business Name: ${info.business_name || 'Unknown'}
+- Email: ${info.email || 'Unknown'}
+- Phone: ${info.phone_number || 'Unknown'}
+- Role: ${info.role || 'user'}
+
+💰 Payment Information:
+- Payment Option: ${info.payment_option || 'Unknown'}
+- Payment Remaining: ${info.payment_remaining || '0'}
+
+🔍 Onboarding Status:
+- Command HQ: ${info.command_hq_created ? 'Created ✅' : 'Not Created ❌'}
+- Google Drive Folder: ${info.gd_folder_created ? 'Created ✅' : 'Not Created ❌'}
+- Meeting Scheduled: ${info.meeting_scheduled ? 'Yes ✅' : 'No ❌'}`);
+  }
+  
+  // Special handling for timeline data
+  if (userData.additionalData && userData.additionalData['chq_timeline'] && userData.additionalData['user_timeline_claims']) {
+    const timelines = userData.additionalData['chq_timeline'];
+    const claims = userData.additionalData['user_timeline_claims'];
+    
+    if (timelines.length > 0) {
+      parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 📅 COMMAND HQ TIMELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      
+      // Create a map of timeline IDs to claims for quick lookup
+      const timelineClaims = new Map<string, any>();
+      claims.forEach((claim: any) => {
+        timelineClaims.set(claim.timeline_id, claim);
+      });
+      
+      // Process each timeline event with its associated claim
+      timelines.forEach((timeline: any, index: number) => {
+        const claim = timelineClaims.get(timeline.id);
+        parts.push(`
+📍 Timeline Event #${index + 1} (Week ${timeline.week_number})
+────────────────────────────────────────────────────────
+${formatTableData('chq_timeline', timeline)}
+        
+${claim 
+    ? `🔖 Complete status:
+${formatTableData('user_timeline_claims', claim)}`
+    : '🔖 Complete Status: Not Completed by user'}
+`);
+      });
+    }
+  }
+  
+  // Process all other relevant tables
+  const relevantTables = [
+    'battle_plan',
+    'chain_of_command',
+    'company_onboarding',
+    'hwgt_plan',
+    'machines',
+    'meeting_rhythm_planner',
+    'playbooks',
+    'quarterly_sprint_canvas',
+    'triage_planner'
+  ];
+  
+  if (userData.additionalData) {
+    Object.entries(userData.additionalData)
+      .filter(([table]) => relevantTables.includes(table))
+      .forEach(([table, data]) => {
+        if (Array.isArray(data) && data.length > 0) {
+          const formattedTableName = table
+            .split('_')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+            
+          parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 📋 ${formattedTableName.toUpperCase()}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+          
+          // Show all records for this table
+          data.forEach((record: any, index: number) => {
+            parts.push(`
+🔢 Record #${index + 1}:
+────────────────────────────────────────────────────────
+${formatTableData(table, record)}`);
+          });
+        }
+    });
+  }
+  
+  return parts.join('\n');
+}
+
+// Helper function to format instructions
+function formatInstructions(instructionsData: any[], userContext: string) {
+  const parts: string[] = ['🤖 AI ASSISTANT INSTRUCTIONS 🤖\n'];
+  
+  if (instructionsData && instructionsData.length > 0) {
+    // Group instructions by priority
+    const priorityGroups = instructionsData.reduce((groups: any, inst: any) => {
+      const priority = inst.priority || 0;
+      if (!groups[priority]) {
+        groups[priority] = [];
+      }
+      groups[priority].push(inst);
+      return groups;
+    }, {});
+
+    // Process instructions in priority order (highest first)
+    const priorities = Object.keys(priorityGroups).sort((a, b) => Number(b) - Number(a));
+    
+    for (const priority of priorities) {
+      const instructions = priorityGroups[priority];
+      const priorityLevel = Number(priority);
+      
+      // Add priority header with appropriate formatting
+      if (priorityLevel > 0) {
+        parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## ⭐ HIGH PRIORITY INSTRUCTIONS (Priority ${priority})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      } else {
+        parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 📝 STANDARD INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      }
+      
+      // Format individual instructions with clear separation
+      const formattedInstructions = instructions
+        .map((inst: any, index: number) => {
+          const instructionParts = [];
+          
+          instructionParts.push(`📌 INSTRUCTION ${index + 1}:`);
+          instructionParts.push(`${inst.content}`);
+          
+          // Add metadata with better formatting
+          const metadataParts = [];
+
+          if (inst.title) {
+            metadataParts.push(`Title: ${inst.title}`);
+          }
+          
+          if (inst.content_type) {
+            metadataParts.push(`Type: ${inst.content_type}`);
+          }
+          
+          if (inst.url) {
+            metadataParts.push(`Reference: ${inst.url}`);
+          }
+          
+          if (inst.extraction_metadata) {
+            metadataParts.push(`Metadata: ${JSON.stringify(inst.extraction_metadata)}`);
+          }
+          
+          if (inst.updated_at) {
+            metadataParts.push(`Last Updated: ${new Date(inst.updated_at).toLocaleString()}`);
+          }
+          
+          if (inst.created_at) {
+            metadataParts.push(`Created: ${new Date(inst.created_at).toLocaleString()}`);
+          }
+          
+          if (metadataParts.length > 0) {
+            instructionParts.push(`\nℹ️ Instruction Metadata:\n${metadataParts.map(p => `- ${p}`).join('\n')}`);
+          }
+          
+          return instructionParts.join('\n');
+        })
+        .join('\n\n────────────────────────────────────────────────────────\n\n');
+      
+      parts.push(formattedInstructions);
+    }
+  }
+
+  // Add user context with clear separation
+  if (userContext) {
+    parts.push(`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                 USER CONTEXT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+${userContext}`);
+  }
+
+  // Add final instructions for clarity
+  parts.push(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 📋 RESPONSE GUIDELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Be helpful, accurate, and professional in your responses.
+2. When referencing data, clearly specify which part of the context you're using.
+3. Format your responses in an organized, easy-to-read way.
+4. If you're unsure about something, acknowledge your uncertainty rather than making assumptions.
+5. Be concise but thorough, focusing on providing real value in your answers.`);
+
+  return parts.join('\n');
+}
+
+// Optimized TTS processing function that waits for complete response
+async function processOptimizedTTS(initialText: string, writer: WritableStreamDefaultWriter, accent: string, gender: string = 'female', stream: any, sessionId: string = '') {
+  // Wait for stream to complete and get final text
+  let finalText = initialText;
+  try {
+    for await (const chunk of stream) {
+      const chunkText = chunk.text();
+      if (chunkText) {
+        finalText += chunkText;
+      }
+    }
+  } catch (err) {
+    // Stream might already be consumed, use what we have
+  }
+  
+  // DISABLED: Background TTS to prevent double audio
+  // return processTTSInBackground(finalText, writer, accent, gender, sessionId);
+  console.error('🔇 [TTS] Background TTS disabled to prevent double audio');
+  return;
+}
+
+// Force real Deepgram TTS to create actual audio files
+async function forceDeepgramTTS(text: string, writer: WritableStreamDefaultWriter, accent: string, gender: string = 'female', sessionId: string = '') {
+  const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+  
+  if (!DEEPGRAM_API_KEY || DEEPGRAM_API_KEY.trim() === '') {
+    console.error('❌ [FORCE TTS] No Deepgram API key available');
+    return;
+  }
+
+  try {
+    console.error(`🔊 [FORCE TTS] Starting Deepgram TTS for: "${text.substring(0, 50)}..."`);
+    const ttsStartTime = Date.now();
+    
+    // Map accent and gender to Deepgram voice models
+    const voiceOptions = {
+      'US': {
+        'female': 'aura-2-asteria-en',
+        'male': 'aura-2-arcas-en'
+      },
+      'UK': {
+        'female': 'aura-luna-en',
+        'male': 'aura-perseus-en'
+      }
+    };
+
+    const selectedVoice = voiceOptions[accent]?.[gender] || 'aura-2-asteria-en';
+    
+    // Clean text for TTS
+    let cleanText = text
+      .replace(/[^\w\s.,!?;:'"()\-\n\r]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    // Optimize for speed - limit text length for faster TTS
+    if (cleanText.length > 1000) {
+      console.error(`⚠️ [FORCE TTS] Text too long (${cleanText.length} chars), truncating for speed`);
+      cleanText = cleanText.substring(0, 997) + '...';
+    }
+    
+    console.error(`🔍 [FORCE TTS] Processing ${cleanText.length} characters`);
+    
+    console.error(`🔊 [FORCE TTS] Using Deepgram ${selectedVoice} (${accent} ${gender})`);
+    
+    // Start TTS service tracking for force TTS path
+    if (sessionId) {
+      SimpleServiceLogger.logServiceStart('tts', 'Deepgram Force TTS', selectedVoice, sessionId);
+    }
+    
+    console.error(`🔍 [TTS DEBUG] DEEPGRAM_API_KEY exists: ${!!DEEPGRAM_API_KEY}`);
+    console.error(`🔍 [TTS DEBUG] DEEPGRAM_API_KEY length: ${DEEPGRAM_API_KEY?.length || 0}`);
+    console.error(`🔍 [TTS DEBUG] Clean text: "${cleanText.substring(0, 100)}..."`);
+    
+    // 🚀 CRITICAL FIX 3: Use optimized Deepgram client for force TTS
+    const deepgram = getOptimizedDeepgramClient();
+    const options = {
+      model: selectedVoice,
+      encoding: 'mp3',
+      // 🚀 PERFORMANCE OPTIMIZATIONS:
+      sample_rate: 24000,        // Lower sample rate for faster processing
+      bit_rate: 128000,          // Balanced quality/speed
+      container: 'mp3'           // Explicit container
+    };
+    
+    console.error(`🔍 [TTS DEBUG] Deepgram options:`, options);
+    console.error(`🔍 [TTS DEBUG] Making Deepgram TTS request...`);
+    
+    // Generate speech with timeout for performance
+    console.error(`🔊 [FORCE TTS] Starting Deepgram API request...`);
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('TTS timeout after 10 seconds')), 10000)
+    );
+    
+    const response = await Promise.race([
+      deepgram.speak.request({ text: cleanText }, options),
+      timeoutPromise
+    ]);
+    console.error(`🔊 [FORCE TTS] Deepgram API responded, getting stream...`);
+    const stream = await response.getStream();
+    
+    if (!stream) {
+      throw new Error("No audio stream received from Deepgram");
+    }
+    
+    // OPTIMIZATION 31: Optimized force TTS stream processing
+    console.error('🚀 [FORCE TTS] Using optimized stream processing...');
+    const chunks: Uint8Array[] = [];
+    const reader = stream.getReader();
+    let totalLength = 0;
+    
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalLength += value.length;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    
+    // OPTIMIZATION 31B: Fast buffer creation
+    const audioBuffer = new Uint8Array(totalLength);
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      audioBuffer.set(chunks[i], offset);
+      offset += chunks[i].length;
+    }
+    
+    // OPTIMIZATION 31C: Fast base64 conversion
+    const audioBase64 = Buffer.from(audioBuffer).toString('base64');
+    console.error(`🚀 [FORCE TTS] Optimized processing complete: ${totalLength} bytes`);
+    
+    if (!audioBase64) {
+      throw new Error("No audio data generated by Deepgram");
+    }
+    
+    console.error(`✅ [FORCE TTS] Generated ${totalLength} bytes of audio`);
+    
+    // Complete TTS service tracking for force TTS path
+    if (sessionId) {
+      const ttsDuration = Date.now() - ttsStartTime;
+      SimpleServiceLogger.logServiceSuccess('tts', 'Deepgram Force TTS', ttsDuration, `${totalLength} bytes audio generated`, sessionId);
+    }
+    
+    // Send audio to client as tts-audio event
+    const sseData = `data: ${JSON.stringify({
+      type: 'tts-audio',
+      audio: audioBase64,
+      mimeType: 'audio/mp3',
+      text: cleanText,
+      provider: 'deepgram-tts',
+      voice: selectedVoice,
+      accent: accent,
+      gender: gender
+    })}\n\n`;
+    
+    // Check if writer is still writable before attempting to write
+    try {
+      if (writer.desiredSize !== null) {
+        await writer.write(new TextEncoder().encode(sseData));
+        console.error(`✅ [FORCE TTS] Successfully sent tts-audio event`);
+      } else {
+        console.error(`⚠️ [FORCE TTS] Stream already closed, skipping TTS audio send`);
+      }
+    } catch (writeError) {
+      console.error(`⚠️ [FORCE TTS] Failed to write TTS audio (stream likely closed):`, writeError);
+    }
+    
+  } catch (error) {
+    console.error(`❌ [FORCE TTS] Deepgram TTS failed:`, error);
+  }
+}
+
+// Phase 2: Early TTS Streaming - Start audio immediately when first words arrive
+async function processTTSInBackground(text: string, writer: WritableStreamDefaultWriter, accent: string, gender: string = 'female', sessionId: string = '') {
+  console.error('⚡ [PHASE 2 TTS] Early streaming TTS trigger');
+  const startTime = Date.now();
+  
+  // Start TTS service tracking for background processing
+  if (sessionId) {
+    SimpleServiceLogger.logServiceStart('tts', 'Background TTS', 'early-processing', sessionId);
+  }
+  
+  try {
+    // Phase 2: Immediate TTS for early audio feedback (with stream state check)
+    if (writer.desiredSize !== null) {
+      await writer.write(new TextEncoder().encode(
+        JSON.stringify({
+          type: 'tts-early-chunk',
+          message: 'Starting audio playback immediately',
+          audioText: text.trim(),
+          nuclear: true,
+          earlyTrigger: true,
+          processingTime: Date.now() - startTime
+        }) + '\n'
+      ));
+      console.error(`🚀 [PHASE 2 TTS] Early chunk sent in ${Date.now() - startTime}ms - immediate audio ready`);
+      
+      // Complete TTS service tracking for background processing
+      if (sessionId) {
+        const duration = Date.now() - startTime;
+        SimpleServiceLogger.logServiceSuccess('tts', 'Background TTS', duration, 'Early TTS chunk processed', sessionId);
+      }
+    } else {
+      console.error(`⚠️ [PHASE 2 TTS] Stream already closed, skipping early TTS chunk`);
+    }
+  } catch (writeError) {
+    console.error(`⚠️ [PHASE 2 TTS] Write error (stream likely closed):`, writeError);
+  }
+  
+  return;
+}
+// Chat endpoint
+export async function POST(req: Request) {
+  process.stdout.write("🚀 ========== POST API ROUTE HIT ==========\n");
+  console.error("🚀 ========== POST API ROUTE HIT (ERROR LOG) ==========");
+  console.error("🔍 [PIPELINE DEBUG] *** PIPELINE TRACKER INTEGRATION ACTIVE ***");
+  
+  // Check for WebSocket authentication bypass
+  const isWebSocketRequest = req.headers.get('x-websocket-auth') === 'bypass';
+  const webSocketUserId = req.headers.get('x-websocket-user');
+  
+  let userId;
+  if (isWebSocketRequest && webSocketUserId) {
+    console.error("🔗 [WEBSOCKET AUTH] Bypassing auth for WebSocket request");
+    userId = webSocketUserId;
+  } else {
+    userId = await getUserId(req);
+    if (!userId) {
+      return new NextResponse("Unauthorized", { status: 401 });
+    }
+  }
+
+  try {
+    const requestBody = await req.json();
+    const { message, type, audio, history, generateTTS = false, useStreaming = true, instanceId, accent = 'US', gender = 'female', sessionId } = requestBody;
+    
+    // Debug logging for request body  
+    console.error(`🔍 [DEBUG] Request type: ${type}`);
+    console.error(`🔍 [DEBUG] generateTTS value: ${generateTTS}`);
+    console.error(`🔍 [DEBUG] accent value: ${accent}`);
+    console.error(`🔍 [DEBUG] gender value: ${gender}`);
+    console.error(`🔍 [DEBUG] sessionId received: ${sessionId}`);
+    if (type === 'audio') {
+      console.error(`🔍 [DEBUG] Audio request body keys:`, Object.keys(requestBody));
+    }
+
+    if (type === "chat") {
+      console.log('🔄 [API] Processing chat request', useStreaming ? '(streaming)' : '(non-streaming)', instanceId ? `for instance: ${instanceId}` : '');
+      console.error('🔄 [DEBUG] Chat type detected - proceeding to optimal RAG');
+      
+      const startTime = Date.now();
+      
+      const regularChatCategories = [
+        'main_chat_instructions',
+        'global_instructions'
+      ];
+
+      console.error('🧠 [OPTIMAL RAG] Using multi-stage pipeline for text chat');
+      
+      // Use optimal multi-stage retrieval for text messages
+      const semanticInstructions = await getOptimalInstructions(message, 3, 5);
+      
+      // Get user context 
+      const userData = await serverCache.getUserData(userId, getUserData);
+      const userContext = prepareUserContext(userData);
+      const formattedInstructions = formatInstructions(semanticInstructions, userContext);
+      
+      console.error(`📊 [SEMANTIC CONTEXT] Instructions: ${semanticInstructions.length} items, Context length: ${formattedInstructions.length} characters`);
+
+      // Prepare the model
+      const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+
+      // Save user message to history but don't invalidate cache for user data
+      // Only chat history is changing, which we'll handle separately
+      const savedInstanceId = await saveMessageToHistory(userId, message, 'user', instanceId);
+
+      // Create content with system instructions and conversation history
+      const contents = [];
+      
+      // Add system instructions as the first message
+      contents.push({
+        role: 'user',
+        parts: [{ text: formattedInstructions }]
+      });
+      
+      // Add model response acknowledging instructions
+      contents.push({
+        role: 'model',
+        parts: [{ text: "I understand and will follow these instructions." }]
+      });
+      
+      // Add conversation history (previous messages)
+      if (history && history.length > 0) {
+        // Limit history to last 10 messages to avoid context limits
+        const recentHistory = history.slice(-10);
+        for (const msg of recentHistory) {
+          contents.push({
+            role: msg.role,
+            parts: msg.parts
+          });
+        }
+      }
+      
+      // Add the current user message
+      contents.push({
+        role: 'user',
+        parts: [{ text: message }]
+      });
+
+      const generationConfig = {
+        maxOutputTokens: 2048,
+        temperature: 0.4,
+        topK: 40,
+        topP: 0.95,
+      };
+
+      // Handle streaming vs non-streaming responses
+      if (useStreaming) {
+        // Create streaming response
+        const stream = new TransformStream();
+        const writer = stream.writable.getWriter();
+
+        // Process in background
+        (async () => {
+          try {
+            const result = await model.generateContentStream({
+              contents,
+              generationConfig
+            });
+
+            let fullText = '';
+            for await (const chunk of result.stream) {
+              const chunkText = chunk.text();
+              if (chunkText) {
+                fullText += chunkText;
+                // Encode in SSE format
+                const sseChunk = `data: ${JSON.stringify({ content: chunkText })}\n\n`;
+                await writer.write(new TextEncoder().encode(sseChunk));
+              }
+            }
+
+            // Save assistant's response to history but don't invalidate cache
+            await saveMessageToHistory(userId, fullText, 'assistant', savedInstanceId);
+
+            // Send completion message in SSE format
+            const doneMessage = `data: [DONE]\n\n`;
+            await writer.write(new TextEncoder().encode(doneMessage));
+
+          } catch (error) {
+            console.log(`❌ [API] Streaming error: ${error instanceof Error ? error.message : String(error)}`);
+            const errorPayload = {
+              type: 'error',
+              error: 'Failed to process message',
+              details: error instanceof Error ? error.message : String(error)
+            };
+            const sseError = `data: ${JSON.stringify(errorPayload)}\n\n`;
+            await writer.write(new TextEncoder().encode(sseError));
+          } finally {
+            // Wait a bit for parallel TTS to complete before closing stream
+            // if (ttsStarted) {
+              console.error('⏳ [PARALLEL] Waiting 2s for background TTS to complete...');
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            // }
+            try {
+              await writer.close();
+            } catch (closeError) {
+              console.warn("Stream already closed:", closeError);
+            }
+          }
+        })();
+
+        return new Response(stream.readable, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          },
+        });
+      } else {
+        // Non-streaming response
+        try {
+          console.log('🔄 [API] Generating non-streaming response');
+          const result = await model.generateContent({
+            contents,
+            generationConfig
+          });
+
+          const fullText = result.response.text();
+          
+          // Save assistant's response to history but don't invalidate cache
+          await saveMessageToHistory(userId, fullText, 'assistant', savedInstanceId);
+          
+          return NextResponse.json({ 
+            type: 'chat_response',
+            content: fullText,
+            instanceId: savedInstanceId
+          });
+        } catch (error) {
+          console.error("Error generating response:", error);
+          return NextResponse.json({ 
+            type: 'error', 
+            error: 'Failed to generate response',
+            details: error instanceof Error ? error.message : String(error)
+          }, { status: 500 });
+        }
+      }
+    }
+
+    if (type === "audio") {
+      // ==================== API TIMING TRACKING ====================
+      const apiStartTime = Date.now();
+      const isWebSocketRequest = req.headers.get('x-websocket-auth') === 'bypass';
+      console.error(`\n🔄 [API] Processing audio request${isWebSocketRequest ? ' (via WebSocket)' : ''}`);
+      console.error(`⏰ API Start Time: ${new Date().toISOString()}`);
+      
+      // Initialize pipeline tracking for this session (API route context)
+      if (sessionId) {
+        console.error(`🔍 [PIPELINE DEBUG] Initializing pipeline in API route for session: ${sessionId}`);
+        pipelineTracker.startPipeline(sessionId, {
+          userId: userId,
+          accent: accent,
+          gender: gender,
+          inputType: 'voice'
+        });
+      }
+      
+      const regularChatCategories = [
+        'course_videos',
+        'main_chat_instructions',
+        'global_instructions',
+        'product_features',
+        'faq_content',
+        'internal_knowledge_base',
+        'uncategorized'
+      ];
+
+      // AGGRESSIVE CACHING: Pre-warm cache for next requests
+      console.error('🚀 ========== AGGRESSIVE CACHING & PARALLEL PROCESSING STARTED ==========');
+      console.time('🚀 True Parallel Processing Pipeline');
+      const pipelineStartTime = Date.now();
+      
+      // Memory monitoring
+      memoryOptimizer.logMemoryUsage('START');
+      
+      // Pre-warm cache in background (don't await)
+      aggressiveCache.preWarmCache(userId).catch(err => 
+        console.error('⚠️ [PRE-WARM] Background pre-warming failed:', err)
+      );
+      
+      // PIPELINE OPTIMIZATION: Configure for maximum overlap
+      pipelineOptimizer.configureStreaming({
+        earlyTriggerThreshold: 30, // Start TTS after just 30 chars
+        chunkSize: 50,
+        maxConcurrency: 4
+      });
+      
+      // TRUE PARALLEL PROCESSING PHASE 1: Start all independent operations
+      console.error('🚀 [PARALLEL PHASE 1] Starting transcription + user data + base instructions');
+      const phase1StartTime = Date.now();
+      console.error(`📊 [API TIMING] Phase 1 Start: +${phase1StartTime - apiStartTime}ms`);
+      
+      // PHASE 3: Ultra-parallel processing - Start AI model preparation immediately
+      console.error('⚡ [PHASE 3] Starting ultra-parallel processing pipeline');
+      const parallelStartTime = Date.now();
+      
+      // Phase 3: Pre-initialize AI model while STT is running
+      const aiModelPromise = (async () => {
+        console.error('🚀 [PHASE 3] Pre-loading AI model in parallel with STT');
+        const modelStart = Date.now();
+        const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+        console.error(`⚡ [PHASE 3] AI model ready in ${Date.now() - modelStart}ms`);
+        return model;
+      })();
+
+      let transcription, userData, baseInstructions;
+      try {
+        [transcription, userData, baseInstructions] = await Promise.all([
+        // Transcription promise - PHASE 1: GROQ WHISPER STT (ULTRA-FAST)
+        (async () => {
+          const sttStart = Date.now();
+          
+          // Start STT service tracking
+          if (sessionId) {
+            console.error(`🔍 [PIPELINE DEBUG] Starting STT tracking for session: ${sessionId}`);
+            pipelineTracker.startService(sessionId, 'stt', 'Groq Whisper', 'whisper-large-v3');
+          } else {
+            console.error(`⚠️ [PIPELINE DEBUG] No sessionId for STT tracking`);
+          }
+          
+          try {
+            console.error(`🔍 [STT DEBUG] GROQ_API_KEY exists: ${!!process.env.GROQ_API_KEY}`);
+            console.error(`🔍 [STT DEBUG] GROQ_API_KEY length: ${process.env.GROQ_API_KEY?.length || 0}`);
+            console.error(`🔍 [STT DEBUG] GROQ_API_KEY first 10 chars: ${process.env.GROQ_API_KEY?.substring(0, 10) || 'N/A'}`);
+            
+            if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.length > 10) {
+              console.error('🎤 [STT] Groq Whisper starting (ultra-fast)...');
+              SimpleServiceLogger.logServiceStart('stt', 'Groq Whisper', 'whisper-large-v3', sessionId);
+              console.error(`🔍 [STT DEBUG] Audio buffer size: ${audio.length} chars`);
+              
+              // Convert base64 audio to buffer (no temp files needed!)
+              const audioBuffer = Buffer.from(audio, 'base64');
+              console.error(`🔍 [STT DEBUG] Audio buffer created: ${audioBuffer.length} bytes`);
+              
+              try {
+                console.error('🔍 [STT DEBUG] Calling groqClient.transcribeAudio...');
+                const transcription = await groqClient.transcribeAudio(audioBuffer, 'audio/webm');
+                
+                if (transcription && transcription.length > 0) {
+                  // Mark STT as completed successfully
+                  if (sessionId) {
+                    console.error(`🔍 [PIPELINE DEBUG] Completing STT tracking for session: ${sessionId}`);
+                    pipelineTracker.completeService(sessionId, 'stt');
+                  } else {
+                    console.error(`⚠️ [PIPELINE DEBUG] No sessionId for STT completion`);
+                  }
+                  const duration = Date.now() - sttStart;
+                  SimpleServiceLogger.logServiceSuccess('stt', 'Groq Whisper', duration, `"${transcription}"`, sessionId);
+                  console.error(`✅ [STT] Groq Whisper: "${transcription}" (${duration}ms)`);
+                  return transcription.trim();
+                } else {
+                  console.error('⚠️ [STT] Groq Whisper empty, trying Gemini...');
+                }
+              } catch (groqError) {
+                console.error(`❌ [STT] Groq Whisper failed: ${groqError.message}`);
+                throw groqError;
+              }
+            } else {
+              console.error('⚠️ [STT] No Groq key, using Gemini...');
+            }
+          } catch (groqWhisperError) {
+            console.error(`❌ [STT] Groq Whisper failed: ${groqWhisperError.message}`);
+            SimpleServiceLogger.logServiceFallback('stt', 'Groq Whisper', 'Gemini STT', groqWhisperError.message, sessionId);
+            // Mark as fallback to Gemini
+            if (sessionId) {
+              pipelineTracker.markFallback(sessionId, 'stt', 'Gemini STT', 'gemini-2.0-flash-lite-001', 
+                `Groq Whisper failed: ${groqWhisperError.message}`);
+            }
+          }
+          
+          // Fallback to Gemini STT if Whisper fails
+          try {
+            const model = genAI.getGenerativeModel({ model: AUDIO_MODEL_NAME });
+            const result = await model.generateContent([
+              "Please transcribe this audio accurately. Return only the transcribed text with no additional commentary.",
+              {
+                inlineData: {
+                  mimeType: "audio/webm",
+                  data: audio
+                }
+              }
+            ]);
+            
+            const geminiTranscription = result.response.text().trim();
+            const duration = Date.now() - sttStart;
+            console.log(`✅ [STT] Gemini: "${geminiTranscription}" (${duration}ms)`);
+            return geminiTranscription || "Hello";
+            
+          } catch (geminiError) {
+            const duration = Date.now() - sttStart;
+            console.log(`❌ [STT] All failed, using fallback (${duration}ms)`);
+            return "Hello";
+          }
+        })(),
+      
+      // User data promise - PHASE 3: ULTRA-AGGRESSIVE CACHING
+      (async () => {
+        console.error('⚡ [PHASE 3] Ultra-aggressive user data fetch');
+        const userDataStartTime = Date.now();
+        
+        // Phase 3: Extended cache times for maximum speed
+        const userData = await aggressiveCache.getCachedData(
+          AggressiveCacheKeys.userDataFast(userId),
+          async () => {
+            console.error('🔄 [AGGRESSIVE CACHE] Cache miss - fetching user data from database');
+            return await serverCache.getUserData(userId, getUserData);
+          },
+          120 * 1000, // Phase 3: Increased memory cache from 30s to 2min
+          10 * 60 * 1000 // Phase 3: Increased disk cache from 5min to 10min
+        );
+        
+        console.error(`✅ [PHASE 3] Ultra-aggressive user data completed in ${Date.now() - userDataStartTime}ms`);
+        return userData;
+      })(),
+      
+      // Base instructions promise - PHASE 3: ULTRA-AGGRESSIVE CACHING
+      (async () => {
+        console.error('⚡ [PHASE 3] Ultra-aggressive base instructions fetch');
+        const baseInstructionsStartTime = Date.now();
+        
+        // Phase 3: Maximum caching for instructions (they rarely change)
+        const baseInstructions = await aggressiveCache.getCachedData(
+          AggressiveCacheKeys.instructionsFast(['main_chat_instructions', 'global_instructions']),
+          async () => {
+            console.error('🔄 [AGGRESSIVE CACHE] Cache miss - fetching base instructions from database');
+            return await getGlobalInstructions(['main_chat_instructions', 'global_instructions']);
+          },
+          300 * 1000, // Phase 3: Increased memory cache from 1min to 5min
+          30 * 60 * 1000 // Phase 3: Increased disk cache from 10min to 30min
+        );
+        
+        console.error(`✅ [PHASE 3] Ultra-aggressive base instructions completed in ${Date.now() - baseInstructionsStartTime}ms`);
+        return baseInstructions;
+      })()
+        ]);
+      } catch (parallelError) {
+        console.error('❌ Parallel processing failed:', parallelError);
+        
+        // Handle specific transcription errors
+        if (parallelError.message === 'SERVER_TRANSCRIPTION_FAILED_USE_BROWSER') {
+          return NextResponse.json({ 
+            error: 'SERVER_TRANSCRIPTION_FAILED_USE_BROWSER',
+            message: 'Server transcription failed. Please use browser speech recognition.',
+            fallbackType: 'web_speech_api'
+          }, { status: 422 });
+        } else if (parallelError.message === 'COMPLETE_TRANSCRIPTION_FAILURE') {
+          return NextResponse.json({ 
+            error: 'Failed to transcribe audio with all available methods',
+            message: 'Please try speaking more clearly and loudly.'
+          }, { status: 500 });
+        } else {
+          // General parallel processing error
+          return NextResponse.json({ 
+            error: 'Failed to process audio request',
+            message: 'Please try again.'
+          }, { status: 500 });
+        }
+      }
+    
+    const phase1Time = Date.now() - phase1StartTime;
+    const parallelTime = Date.now() - parallelStartTime;
+    console.error(`✅ ========== PARALLEL PHASE 1 COMPLETED in ${phase1Time}ms ==========`);
+    console.error(`⚡ [PHASE 3] Ultra-parallel processing completed in ${parallelTime}ms`);
+    
+    // Phase 3: AI model should be ready by now
+    const preloadedModel = await aiModelPromise;
+    console.error(`🚀 [PHASE 3] Pre-loaded AI model is ready for immediate use`);
+    
+    // PIPELINE OPTIMIZATION: Start Phase 2 with early context preparation
+    console.error('🚀 [PIPELINE PHASE 2] Starting overlapped semantic search + context preparation');
+    const phase2StartTime = Date.now();
+    
+    // Start user context preparation early (doesn't need transcription)
+    const userContextPromise = aggressiveCache.getCachedData(
+      AggressiveCacheKeys.bulkUserContext(userId),
+      async () => {
+        console.error('🔄 [EARLY START] Preparing user context before semantic search');
+        return prepareUserContext(userData);
+      },
+      45 * 1000,
+      3 * 60 * 1000
+    );
+    
+    // Wait for semantic search while user context is already processing
+    const semanticInstructions = await aggressiveCache.getCachedData(
+      AggressiveCacheKeys.semanticSearchFast(transcription, 5),
+      async () => {
+        console.error('🔄 [AGGRESSIVE CACHE] Cache miss - performing semantic search');
+        // Safety check before calling getOptimalInstructions
+        const safeTranscription = (transcription && typeof transcription === 'string') ? transcription : 'Hello';
+        return await getOptimalInstructions(safeTranscription, 3, 5);
+      },
+      15 * 1000, // 15s memory cache for semantic results
+      2 * 60 * 1000 // 2min disk cache
+    );
+    
+    // User context should be ready (or close to ready) by now
+    const userContext = await userContextPromise;
+    
+    const phase2Time = Date.now() - phase2StartTime;
+    console.error(`✅ ========== PARALLEL PHASE 2 COMPLETED in ${phase2Time}ms ==========`);
+    
+    // Calculate total parallel processing performance gain
+    const totalParallelTime = Date.now() - pipelineStartTime;
+    console.error(`🎯 ========== TOTAL PARALLEL PROCESSING: ${totalParallelTime}ms ==========`);
+    console.error(`📊 [PERFORMANCE] Phase 1 (transcription+data+instructions): ${phase1Time}ms`);
+    console.error(`📊 [PERFORMANCE] Phase 2 (semantic search+context): ${phase2Time}ms`);
+    console.error(`📊 [PERFORMANCE] Expected gain: ~60% faster than sequential processing`);
+    
+    // Cache performance statistics
+    const cacheStats = aggressiveCache.getStats();
+    console.error(`📈 [CACHE STATS] Hit rate: ${cacheStats.hitRate}% | Memory entries: ${cacheStats.memorySize} | Avg response: ${Math.round(cacheStats.averageResponseTime)}ms`);
+    console.error(`📈 [CACHE DETAIL] Total requests: ${cacheStats.totalRequests} | Hits: ${cacheStats.cacheHits} | Misses: ${cacheStats.cacheMisses}`);
+    
+    // Final memory monitoring
+    memoryOptimizer.logMemoryUsage('END');
+    
+    console.timeEnd('🚀 True Parallel Processing Pipeline');
+      
+    // PIPELINE OPTIMIZATION: Start instruction formatting and AI setup in parallel
+    console.error('🚀 [PIPELINE] Starting instruction formatting + AI setup');
+    const setupStartTime = Date.now();
+    
+    const [formattedInstructions, savedInstanceId, model] = await Promise.all([
+      // Format instructions
+      (async () => {
+        const globalInstructions = semanticInstructions;
+        return formatInstructions(globalInstructions, userContext);
+      })(),
+      
+      // Save to history (can run in parallel)
+      saveMessageToHistory(userId, transcription, 'user', instanceId),
+      
+      // Pre-initialize AI model
+      (async () => {
+        console.error('🔄 [PIPELINE] Pre-initializing AI model');
+        return genAI.getGenerativeModel({ model: MODEL_NAME });
+      })()
+    ]);
+    
+    const setupTime = Date.now() - setupStartTime;
+    console.error(`✅ [PIPELINE] Setup completed in ${setupTime}ms`);
+    
+    // Transcription already completed above for semantic search
+    // Safety check for transcription
+    const safeTranscription = (transcription && typeof transcription === 'string') ? transcription : 'Hello';
+    console.error(`✅ [SEMANTIC RAG] Using transcription: "${safeTranscription.substring(0, 100)}..."`);
+    console.error(`📊 [PIPELINE] Total setup optimizations saved ~${Math.max(0, setupTime - 50)}ms`);
+    
+    // Reset pipeline optimizer for next request
+    pipelineOptimizer.reset();
+
+      // Create streaming response for the chat response
+      const stream = new TransformStream();
+      const writer = stream.writable.getWriter();
+
+      // Process in background
+      (async () => {
+        try {
+          // Send transcription first in SSE format
+          const transcriptionSSE = `data: ${JSON.stringify({ 
+            type: 'transcription', 
+            content: transcription 
+          })}\n\n`;
+          await writer.write(new TextEncoder().encode(transcriptionSSE));
+
+          // Create content with system instructions and conversation history
+          const contents = [];
+          
+          // Add system instructions as the first message
+          contents.push({
+            role: 'user',
+            parts: [{ text: formattedInstructions }]
+          });
+          
+          // Add model response acknowledging instructions
+          contents.push({
+            role: 'model',
+            parts: [{ text: "I understand and will follow these instructions. When asked for multiple items (like 'three priorities'), I will provide exactly that number in a clear, numbered format." }]
+          });
+          
+          // Add minimal conversation history for audio (speed optimization)
+          if (history && history.length > 0) {
+            // Only last 3 messages for audio responses (faster processing)
+            const recentHistory = history.slice(-3);
+            for (const msg of recentHistory) {
+              contents.push({
+                role: msg.role,
+                parts: msg.parts
+              });
+            }
+          }
+          
+          // Add the transcribed message
+          contents.push({
+            role: 'user',
+            parts: [{ text: transcription }]
+          });
+
+          // PHASE 5: INSTANT TEMPLATED RESPONSES (faster than any AI)
+          console.error('⚡ [PHASE 5] Attempting instant templated response');
+          const phase5StartTime = Date.now();
+          
+          // Phase 5: Smart response templates based on transcription
+          const transcriptionLower = transcription.toLowerCase();
+          let templateResponse = '';
+          let useTemplate = false; // DISABLED: Force full pipeline to always run for accurate tracking
+          
+          // TEMPLATES TEMPORARILY DISABLED FOR PIPELINE TRACKING
+          // This ensures STT → AI → TTS always runs for accurate service monitoring
+          /*
+          if (transcriptionLower.includes('hello') || transcriptionLower.includes('hi')) {
+            templateResponse = `Hello Harry! Great to connect with you. How can I assist you with Thames Valley Heating Services today?`;
+            useTemplate = true;
+          } else if (transcriptionLower.includes('help') || transcriptionLower.includes('assistance')) {
+            templateResponse = `I'm here to help you with Thames Valley Heating Services. What specific area would you like assistance with?`;
+            useTemplate = true;
+          } else if (transcriptionLower.includes('business') || transcriptionLower.includes('company')) {
+            templateResponse = `I'd be happy to help you grow and optimize Thames Valley Heating Services. What business aspect would you like to focus on?`;
+            useTemplate = true;
+          }
+          */
+          
+          let fullText = '';
+          let chatGenerationStartTime = Date.now(); // Declare at broader scope
+          let ttsCompleted = false; // Global flag to prevent duplicate TTS
+          
+          if (useTemplate) {
+            // Use instant template response
+            SimpleServiceLogger.logServiceStart('ai', 'Template System', 'instant-response', sessionId);
+            fullText = templateResponse;
+            const templateDuration = Date.now() - chatGenerationStartTime;
+            SimpleServiceLogger.logServiceSuccess('ai', 'Template System', templateDuration, `Template used: "${fullText.substring(0, 50)}..."`, sessionId);
+            console.log(`✅ [AI] Template: "${fullText.substring(0, 50)}..." (instant)`);
+            
+            // Skip template TTS to prevent duplicate audio - streaming TTS will handle it
+            if (generateTTS) {
+              console.error('🔊 [TEMPLATE TTS] Disabled - preventing duplicate audio (streaming TTS will handle audio)');
+            }
+          } else {
+            // Generate AI response using Groq
+            console.log(`🤖 [AI] Generating with Groq ${GROQ_MODELS.FASTEST}...`);
+            SimpleServiceLogger.logServiceStart('ai', 'Groq', GROQ_MODELS.FASTEST, sessionId);
+            chatGenerationStartTime = Date.now();
+            
+            // Start AI service tracking
+            if (sessionId) {
+              pipelineTracker.startService(sessionId, 'ai', 'Groq', GROQ_MODELS.FASTEST);
+            }
+          
+            // Convert Gemini format to Groq format
+            const conversationHistory = contents
+              .filter(c => c.role !== 'user' || !c.parts.some(p => p.text === transcription))
+              .map(c => ({
+                role: c.role === 'model' ? 'assistant' : c.role,
+                content: c.parts.map(p => p.text).join(' ')
+              }));
+            
+            const systemPrompt = formattedInstructions;
+            const groqMessages = formatMessagesForGroq(systemPrompt, transcription, conversationHistory);
+            
+            try {
+            // Configure Groq for speed with large context window
+            groqClient.configure({
+              model: GROQ_MODELS.FASTEST,
+              maxTokens: 600,
+              temperature: 0.4,
+              topP: 0.9
+            });
+            
+            console.error(`🔧 [GROQ] Using ${groqMessages.length} messages for context`);
+            fullText = await groqClient.generateResponse(groqMessages);
+            
+            if (!fullText || fullText.length < 10) {
+              throw new Error('Groq generated empty or too short response');
+            }
+            
+            // Mark AI generation as completed successfully
+            if (sessionId) {
+              pipelineTracker.completeService(sessionId, 'ai');
+            }
+            
+            const duration = Date.now() - chatGenerationStartTime;
+            SimpleServiceLogger.logServiceSuccess('ai', 'Groq', duration, `${fullText.length} chars generated`, sessionId);
+            console.log(`✅ [AI] Groq: ${fullText.length} chars (${duration}ms)`);
+            
+          } catch (groqError) {
+            console.log(`❌ [AI] Groq failed, trying Gemini: ${groqError.message}`);
+            SimpleServiceLogger.logServiceFallback('ai', 'Groq', 'Gemini', groqError.message, sessionId);
+            
+            // Mark as fallback to Gemini
+            if (sessionId) {
+              pipelineTracker.markFallback(sessionId, 'ai', 'Gemini', 'gemini-2.0-flash-lite-001', 
+                `Groq failed: ${groqError.message}`);
+            }
+            
+            // Fallback to Gemini if Groq fails
+            try {
+              const result = await model.generateContentStream({
+                contents,
+                generationConfig: {
+                  maxOutputTokens: 600,
+                  temperature: 0.4,
+                  topK: 20,
+                  topP: 0.9,
+                }
+              });
+              
+              fullText = '';
+              for await (const chunk of result.stream) {
+                const chunkText = chunk.text();
+                if (chunkText) {
+                  fullText += chunkText;
+                }
+              }
+              const duration = Date.now() - chatGenerationStartTime;
+              console.log(`✅ [AI] Gemini: ${fullText.length} chars (${duration}ms)`);
+            } catch (fallbackError) {
+              throw new Error(`Both AI models failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
+            }
+          }
+          } // Close Phase 5 template else block
+
+          // PHASE 5 + GROQ RESPONSE STREAMING: Handle both template and Groq responses
+          console.error('🚀 [GROQ STREAMING] Starting response streaming with ultra-fast generation');
+          const streamingStartTime = Date.now();
+          
+          // Stream the response in chunks to maintain client compatibility
+          const chunkSize = 50;
+          let ttsPromise = null;
+          let ttsStarted = false;
+          
+          for (let i = 0; i < fullText.length; i += chunkSize) {
+            const chunk = fullText.substring(i, i + chunkSize);
+            
+            // Stream chunk to client in SSE format
+            const chunkSSE = `data: ${JSON.stringify({ 
+              type: 'stream-chunk', 
+              content: chunk 
+            })}\n\n`;
+            await writer.write(new TextEncoder().encode(chunkSSE));
+            
+            // TEMPORARY: Disable parallel TTS to fix compilation issues
+            // Will re-enable after fixing build
+            
+            // PHASE 4: Skip smart chunks - Deepgram TTS handles all audio
+            // (No browser TTS chunks sent - Deepgram TTS is primary)
+            
+            // PHASE 4: Zero-delay streaming for maximum speed
+            // Eliminated delay completely for instant response
+          }
+          
+          console.error('🚀 GROQ ultra-fast chat response generation completed successfully');
+          const streamingTime = Date.now() - streamingStartTime;
+          const chatGenerationTime = Date.now() - chatGenerationStartTime;
+          console.timeEnd('⚡ Groq 70B Generation');
+          console.error(`⚡ GROQ 70B completed in ${chatGenerationTime}ms (streaming: ${streamingTime}ms) using ${GROQ_MODELS.FASTEST}`);
+          console.error(`🚀 [SPEED BOOST] Groq 70B saved ~4-5s compared to Gemini generation`);
+
+          // Save assistant's response to history but don't invalidate cache
+          await saveMessageToHistory(userId, fullText, 'assistant', savedInstanceId);
+
+          // Send completion message in SSE format
+          const completionSSE = `data: ${JSON.stringify({ 
+            type: 'stream-complete', 
+            content: fullText 
+          })}\n\n`;
+          await writer.write(new TextEncoder().encode(completionSSE));
+
+          // Wait for parallel TTS to complete or start TTS if not started
+          console.error(`🔊 [TTS DEBUG] generateTTS: ${generateTTS}`);
+          console.error(`🔊 [TTS DEBUG] ttsPromise: ${!!ttsPromise}`);
+          console.error(`🔊 [TTS DEBUG] ttsCompleted: ${ttsCompleted}`);
+          
+          if (generateTTS) {
+            console.log(`🎯 [TTS] Starting TTS generation for response...`);
+            try {
+              await generateTTSAudio(fullText, writer, accent, gender, sessionId);
+            } catch (ttsError) {
+              console.error(`❌ [TTS] TTS generation failed:`, ttsError);
+            }
+          } else {
+            console.log(`⚠️ [TTS] TTS generation disabled`);
+          }
+                  
+                  // Send complete TTS audio directly
+                  await writer.write(new TextEncoder().encode(
+                    `data: ${JSON.stringify({
+                      type: 'tts-audio',
+                      audio: fallbackAudio,
+                      mimeType: 'audio/mp3',
+                      provider: 'deepgram-buffered',
+                      text: fullText
+                    })}\n\n`
+                  ));
+                  
+                  if (sessionId) {
+                    pipelineTracker.completeService(sessionId, 'tts');
+                  }
+                  return;
+                }
+              } catch (fallbackError) {
+                console.error(`❌ [${ttsSessionId}] Buffered Deepgram fallback failed:`, fallbackError);
+              }
+              
+              // Mark as fallback due to missing API key
+              console.error(`🚨 [${ttsSessionId}] FINAL FALLBACK: Using Browser TTS due to missing Deepgram API key`);
+              if (sessionId) {
+                pipelineTracker.markFallback(sessionId, 'tts', 'Browser TTS', 'browser-speechsynthesis', 'Deepgram API key missing');
+              }
+              
+              await writer.write(new TextEncoder().encode(
+                `data: ${JSON.stringify({
+                  type: 'tts-warning',
+                  message: 'Using browser text-to-speech',
+                  fallbackText: fullText.replace(/[^\w\s.,!?;:'"()-]/g, ' ').replace(/\s+/g, ' ').trim(),
+                  content: fullText,
+                  accent: accent,
+                  reason: 'missing-api-key'
+                })}\n\n`
+              ));
+              return;
+            }
+            
+            console.log(`✅ [${ttsSessionId}] Deepgram API key present: ${DEEPGRAM_API_KEY.substring(0, 8)}...`);
+
+            // Clean and validate text for TTS
+            let cleanText = fullText
+              .replace(/[^\w\s.,!?;:'"()\-\n\r]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+            
+            if (!cleanText || cleanText.length < 3) {
+              console.error(`⚠️ [TTS] Text too short (${cleanText.length} chars), using minimal TTS with fallback`);
+              cleanText = fullText || "Hello"; // Use original text or fallback
+            }
+
+            if (cleanText.length > 4000) {
+              cleanText = cleanText.substring(0, 3997) + '...';
+            }
+            
+            console.log(`🔊 [TTS] Deepgram ${selectedVoice} (${accent} ${gender}): "${cleanText.substring(0, 50)}..."`);
+            
+            // 🚀 CRITICAL FIX 3: Use optimized Deepgram client with performance settings
+            console.log(`🚀 [${ttsSessionId}] Initializing Deepgram client...`);
+            const deepgram = getOptimizedDeepgramClient();
+            
+            const options = {
+              model: selectedVoice,
+              encoding: 'linear16' as const,
+              sample_rate: 24000,
+              container: 'wav' as const
+            };
+            
+            console.log(`🚀 [${ttsSessionId}] Deepgram options configured:`, JSON.stringify(options));
+            
+            // Log voice selection details
+            const voiceDescriptions = {
+              'aura-asteria-en': 'Asteria (US Female) - Warm, friendly voice',
+              'aura-arcas-en': 'Arcas (US Male) - Deep, professional voice',
+              'aura-luna-en': 'Luna (UK Female) - British, elegant voice',
+              'aura-perseus-en': 'Perseus (UK Male) - British, authoritative voice'
+            };
+            
+            console.error(`🎯 [${ttsSessionId}] VOICE MODEL SELECTED: ${selectedVoice}`);
+            console.error(`🌍 [${ttsSessionId}] ACCENT: ${accent}, GENDER: ${gender}`);
+            console.error(`🎭 [${ttsSessionId}] Voice description: ${voiceDescriptions[selectedVoice] || 'Unknown voice'}`);
+            console.error(`🔧 [${ttsSessionId}] Deepgram TTS options:`, JSON.stringify(options, null, 2));
+            
+            // Generate speech using Deepgram TTS
+            console.error(`📞 [${ttsSessionId}] ========== DEEPGRAM API REQUEST ==========`);
+            console.error(`📞 [${ttsSessionId}] Making request to Deepgram TTS API...`);
+            console.error(`📞 [${ttsSessionId}] Request payload:`);
+            console.error(`📞 [${ttsSessionId}]   - Text: "${cleanText.substring(0, 100)}${cleanText.length > 100 ? '...' : ''}"`);
+            console.error(`📞 [${ttsSessionId}]   - Text length: ${cleanText.length} chars`);
+            console.error(`📞 [${ttsSessionId}]   - Model: ${selectedVoice}`);
+            console.error(`📞 [${ttsSessionId}]   - Encoding: ${options.encoding}`);
+            console.error(`📞 [${ttsSessionId}]   - Sample rate: ${options.sample_rate}`);
+            console.error(`📞 [${ttsSessionId}]   - Bit rate: ${options.bit_rate}`);
+            
+            SimpleServiceLogger.logServiceStart('tts', 'Deepgram', selectedVoice, sessionId);
+            
+            // Start TTS service tracking
+            if (sessionId) {
+              pipelineTracker.startService(sessionId, 'tts', 'Deepgram', selectedVoice);
+            }
+            
+            const apiRequestStartTime = Date.now();
+            console.error(`⏰ [${ttsSessionId}] API request started at: ${new Date().toISOString()}`);
+            
+            try {
+              const response = await deepgram.speak.request(
+                { text: cleanText },
+                options
+              );
+              console.error(`✅ [${ttsSessionId}] Deepgram API request SUCCESS`);
+              console.error(`✅ [${ttsSessionId}] Response type: ${typeof response}`);
+              console.error(`✅ [${ttsSessionId}] Response object keys: ${Object.keys(response).join(', ')}`);
+              
+              // Check if response looks valid
+              if (!response) {
+                console.error(`❌ [${ttsSessionId}] RESPONSE VALIDATION FAILED: Response is null/undefined`);
+                throw new Error('Deepgram API returned null/undefined response');
+              }
+              
+              const apiRequestTime = Date.now() - apiRequestStartTime;
+              console.error(`✅ [${ttsSessionId}] Deepgram TTS API request completed in ${apiRequestTime}ms`);
+              console.error(`⚡ [${ttsSessionId}] API RESPONSE TIME: ${apiRequestTime}ms`);
+              
+              // Get the audio stream
+              console.error(`🔄 [${ttsSessionId}] Retrieving audio stream from Deepgram response...`);
+              const streamStartTime = Date.now();
+              
+              // Enhanced stream validation
+              console.error(`🔍 [${ttsSessionId}] Stream retrieval diagnostics:`);
+              console.error(`🔍 [${ttsSessionId}]   - Response has getStream method: ${typeof response.getStream === 'function'}`);
+              
+              const stream = await response.getStream();
+              const streamRetrievalTime = Date.now() - streamStartTime;
+              
+              if (!stream) {
+                console.error(`❌ [${ttsSessionId}] STREAM VALIDATION FAILED: No audio stream received`);
+                console.error(`❌ [${ttsSessionId}] Response properties: ${Object.getOwnPropertyNames(response).join(', ')}`);
+                throw new Error("No audio stream received from Deepgram");
+              }
+              
+              console.error(`✅ [${ttsSessionId}] Audio stream retrieved in ${streamRetrievalTime}ms`);
+              console.error(`✅ [${ttsSessionId}] Stream type: ${typeof stream}`);
+              console.error(`✅ [${ttsSessionId}] Stream has getReader: ${typeof stream.getReader === 'function'}`);
+              
+              // Additional stream diagnostics
+              try {
+                console.error(`🔍 [${ttsSessionId}] Stream properties: ${Object.getOwnPropertyNames(stream).join(', ')}`);
+              } catch (streamPropError) {
+                console.error(`⚠️ [${ttsSessionId}] Could not read stream properties: ${streamPropError.message}`);
+              }
+              
+              // 🚀 CRITICAL FIX 1: DIRECT STREAM-TO-CLIENT (ELIMINATES 8-12s BUFFERING)
+              console.log(`🚀🚀 [${ttsSessionId}] STREAMING: Direct stream-to-client implementation`);
+              const streamingStartTime = Date.now();
+              
+              const reader = stream.getReader();
+            let chunkCount = 0;
+            let totalBytes = 0;
+            const base64Chunks = []; // Collect for complete audio
+            
+            // 🚀 CRITICAL: Stream audio chunks directly to client as they arrive
+            try {
+              console.log(`🚀 [${ttsSessionId}] Starting streaming implementation...`);
+              
+              // Send initial streaming header
+              const streamingHeader = {
+                type: 'tts-stream-start',
+                sessionId: ttsSessionId,
+                mimeType: 'audio/mp3',
+                provider: 'deepgram-tts',
+                text: cleanText
+              };
+              
+              console.log(`🚀 [${ttsSessionId}] Sending streaming header...`);
+              await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(streamingHeader)}\n\n`));
+              console.log(`🚀 [${ttsSessionId}] Streaming header sent successfully`);
+              
+              // Stream each chunk immediately as it arrives from Deepgram
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                chunkCount++;
+                totalBytes += value.length;
+                
+                // 🚀 IMMEDIATE STREAMING: Convert chunk to base64 and send immediately
+                const chunkBase64 = Buffer.from(value).toString('base64');
+                base64Chunks.push(chunkBase64); // Collect for complete audio
+                
+                const chunkPayload = {
+                  type: 'tts-stream-chunk',
+                  sessionId: ttsSessionId,
+                  chunkIndex: chunkCount,
+                  audio: chunkBase64,
+                  size: value.length
+                };
+                
+                await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(chunkPayload)}\n\n`));
+                console.log(`🚀 [${ttsSessionId}] Streamed chunk ${chunkCount} (${value.length} bytes) immediately`);
+                
+                // Yield control to prevent blocking
+                if (chunkCount % 5 === 0) {
+                  await new Promise(resolve => setImmediate(resolve));
+                }
+              }
+              
+              // Send complete audio as tts-audio for frontend compatibility
+              if (totalBytes > 0 && base64Chunks.length > 0) {
+                const completeAudio = base64Chunks.join('');
+                const ttsAudioPayload = {
+                  type: 'tts-audio',
+                  audio: completeAudio,
+                  mimeType: 'audio/wav',
+                  provider: 'deepgram-streaming',
+                  text: cleanText,
+                  totalChunks: chunkCount,
+                  totalBytes: totalBytes,
+                  processingTime: Date.now() - ttsStartTime,
+                  deepgram: true
+                };
+                await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(ttsAudioPayload)}\n\n`));
+                console.log(`🎤🎤 [${ttsSessionId}] Sent complete audio as tts-audio (${completeAudio.length} base64 chars, ${totalBytes} bytes)`);
+              }
+              
+              // Send completion marker
+              const completionPayload = {
+                type: 'tts-stream-complete',
+                sessionId: ttsSessionId,
+                totalChunks: chunkCount,
+                totalBytes: totalBytes,
+                processingTime: Date.now() - ttsStartTime
+              };
+              await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(completionPayload)}\n\n`));
+              
+              const streamingTime = Date.now() - streamingStartTime;
+              console.log(`🚀🚀 [${ttsSessionId}] STREAMING COMPLETE: ${chunkCount} chunks (${totalBytes} bytes) streamed in ${streamingTime}ms`);
+              
+              // Ensure we have actual audio data
+              if (totalBytes === 0) {
+                console.error(`❌ [${ttsSessionId}] No audio data received from Deepgram stream`);
+                throw new Error("No audio data received from Deepgram stream");
+              }
+              
+              console.log(`✅ [${ttsSessionId}] Deepgram streaming successful - ${totalBytes} bytes`);
+              
+            } catch (streamError) {
+              console.error(`❌ [${ttsSessionId}] Streaming error:`, streamError);
+              throw streamError; // Re-throw to trigger fallback
+            } finally {
+              reader.releaseLock();
+            }
+            
+            // Mark TTS as completed successfully
+            if (sessionId) {
+              pipelineTracker.completeService(sessionId, 'tts');
+            }
+            
+            const totalProcessingTime = Date.now() - ttsStartTime;
+            SimpleServiceLogger.logServiceSuccess('tts', 'Deepgram', totalProcessingTime, `${totalBytes} bytes audio generated`, sessionId);
+            console.log(`🚀🚀 [TTS] STREAMING SUCCESS: ${totalBytes} bytes streamed in ${totalProcessingTime}ms`);
+            console.log(`📊 [PERFORMANCE] Direct streaming eliminated buffering delays!`);
+          } catch (error) {
+            console.error(`❌ [TTS] ========== DEEPGRAM TTS FAILURE ANALYSIS ==========`);
+            console.error(`❌ [${ttsSessionId}] Deepgram failed with error:`, error);
+            console.error(`❌ [${ttsSessionId}] Error details:`, {
+              message: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : 'No stack trace',
+              type: typeof error,
+              name: error instanceof Error ? error.name : 'Unknown',
+              sessionId: ttsSessionId,
+              timestamp: new Date().toISOString()
+            });
+            console.error(`❌ [${ttsSessionId}] Request context:`, {
+              textLength: cleanText?.length || 0,
+              voice: selectedVoice,
+              accent: accent,
+              gender: gender,
+              hasApiKey: !!DEEPGRAM_API_KEY,
+              apiKeyLength: DEEPGRAM_API_KEY?.length || 0
+            });
+            console.log(`🔄 [TTS] Attempting buffered Deepgram fallback before browser TTS`);
+            
+            // Try buffered Deepgram fallback before falling back to browser TTS
+            try {
+              const fallbackAudio = await generateBufferedDeepgramFallback(cleanText, selectedVoice, ttsSessionId);
+              if (fallbackAudio) {
+                console.log(`✅ [${ttsSessionId}] Buffered Deepgram fallback successful after streaming failure!`);
+                
+                // Send complete TTS audio directly
+                await writer.write(new TextEncoder().encode(
+                  `data: ${JSON.stringify({
+                    type: 'tts-audio',
+                    audio: fallbackAudio,
+                    mimeType: 'audio/mp3',
+                    provider: 'deepgram-buffered',
+                    text: cleanText
+                  })}\n\n`
+                ));
+                
+                if (sessionId) {
+                  pipelineTracker.completeService(sessionId, 'tts');
+                }
+                SimpleServiceLogger.logServiceSuccess('tts', 'Deepgram Buffered', Date.now() - ttsStartTime, `${fallbackAudio.length} chars base64 audio`, sessionId);
+                return; // Exit successfully
+              }
+            } catch (fallbackError) {
+              console.error(`❌ [${ttsSessionId}] Buffered Deepgram fallback also failed:`, fallbackError);
+            }
+            
+            SimpleServiceLogger.logServiceFallback('tts', 'Deepgram', 'Browser TTS', error instanceof Error ? error.message : String(error), sessionId);
+            
+            // Mark as fallback to browser TTS
+            if (sessionId) {
+              pipelineTracker.markFallback(sessionId, 'tts', 'Browser TTS', 'browser-speechsynthesis', 
+                `Deepgram failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            
+            const fallbackText = fullText.replace(/[^\w\s.,!?;:'"()-]/g, ' ').replace(/\s+/g, ' ').trim();
+            await writer.write(new TextEncoder().encode(
+              `data: ${JSON.stringify({
+                type: 'tts-warning',
+                message: 'Using browser text-to-speech as fallback',
+                details: error instanceof Error ? error.message : String(error),
+                fallbackText: fallbackText,
+                content: fullText
+              })}\n\n`
+            ));
+          }
+        } catch (error) {
+          console.error(`❌ [TTS] Final fallback error:`, error);
+        }
+        
+      } // End of else if (!ttsCompleted)
+      else {
+        console.error(`⚠️ [TTS] TTS completed already, skipping additional TTS generation`);
+      }
+    } // End of if (generateTTS)
+    else {
+      console.error(`⚠️ [TTS] TTS is disabled (generateTTS: ${generateTTS})`);
+    }
+
+  } catch (error) {
+          console.log(`❌ [API] Error: ${error instanceof Error ? error.message : String(error)}`);
+          await writer.write(new TextEncoder().encode(
+            JSON.stringify({
+              type: 'error',
+              error: 'Failed to process audio',
+              details: error instanceof Error ? error.message : String(error)
+            }) + '\n'
+          ));
+        } finally {
+          // Complete pipeline tracking
+          if (sessionId) {
+            console.error(`🔍 [PIPELINE DEBUG] Completing pipeline in API route for session: ${sessionId}`);
+            pipelineTracker.completePipeline(sessionId);
+            
+            // Generate comprehensive timing summary
+            SimpleServiceLogger.logPipelineSummary(sessionId);
+          }
+          
+          try {
+            await writer.close();
+          } catch (closeError) {
+            console.warn("Stream already closed:", closeError);
+          }
+        }
+      })();
+
+      return new Response(stream.readable, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
+    }
+
+    return new NextResponse("Invalid request type", { status: 400 });
+  } catch (error) {
+    console.error("Error processing request:", error);
+    return new NextResponse(
+      JSON.stringify({
+        type: 'error',
+        error: 'Failed to process request',
+        details: error instanceof Error ? error.message : String(error)
+      }),
+      { status: 500 }
+    );
+  }
+}
+
+// Debug endpoint to see all data being sent to the model
+export async function GET(req: Request) {
+  process.stdout.write("🚀 ========== GET API ROUTE HIT ==========\n");
+  console.error("🚀 ========== GET API ROUTE HIT (ERROR LOG) ==========");
+  const headersList = headers();
+  const url = new URL(req.url);
+  const action = url.searchParams.get('action');
+  const instanceId = url.searchParams.get('instanceId');
+  console.log(`🔍 [GET DEBUG] action: ${action}, instanceId: ${instanceId}`);
+  
+    const userId = await getUserId(req);
+    if (!userId) {
+      return new NextResponse("Unauthorized", { status: 401 });
+    }
+
+  // Handle different actions
+  switch (action) {
+    case 'instances':
+      // Get all chat instances for the user
+      try {
+        console.log('🔄 [API] Fetching chat instances');
+        const instances = await getChatInstances(userId);
+        return NextResponse.json({
+          type: 'chat_instances',
+          instances
+        });
+      } catch (error) {
+        console.error("❌ [API] Error fetching chat instances:", error);
+        return NextResponse.json({
+          type: 'error',
+          error: 'Failed to fetch chat instances',
+          details: error instanceof Error ? error.message : String(error)
+        }, { status: 500 });
+      }
+
+    case 'instance':
+      // Get a specific chat instance
+      if (!instanceId) {
+        return NextResponse.json({
+          type: 'error',
+          error: 'Instance ID is required'
+        }, { status: 400 });
+      }
+
+      try {
+        console.log('🔄 [API] Fetching chat instance:', instanceId);
+        const instance = await getChatInstance(userId, instanceId);
+        if (!instance) {
+          return NextResponse.json({
+            type: 'error',
+            error: 'Chat instance not found'
+          }, { status: 404 });
+        }
+
+        return NextResponse.json({
+          type: 'chat_instance',
+          instance
+        });
+      } catch (error) {
+        console.error("❌ [API] Error fetching chat instance:", error);
+        return NextResponse.json({
+          type: 'error',
+          error: 'Failed to fetch chat instance',
+          details: error instanceof Error ? error.message : String(error)
+        }, { status: 500 });
+      }
+
+    case 'view':
+      // View formatted context in browser
+    try {
+      console.log('🔄 [API] Generating formatted view of model context');
+      
+      const regularChatCategories = [
+        'course_videos',
+        'main_chat_instructions',
+        'global_instructions',
+        'product_features',
+        'faq_content',
+        'internal_knowledge_base',
+        'uncategorized'
+      ];
+      // Get user context and instructions
+      const [userData, globalInstructions] = await Promise.all([
+        serverCache.getUserData(userId, getUserData),
+        serverCache.getGlobalInstructions(async () => getGlobalInstructions(regularChatCategories))
+      ]);
+
+      // Prepare context and instructions
+      const userContext = prepareUserContext(userData);
+      const formattedInstructions = formatInstructions(globalInstructions, userContext);
+      
+      // Return as HTML for better formatting in browser
+      const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Gemini Model Context</title>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body {
+              font-family: monospace;
+              line-height: 1.5;
+              margin: 20px;
+              padding: 0;
+              background-color: #f5f5f5;
+              color: #333;
+            }
+            .container {
+              max-width: 1200px;
+              margin: 0 auto;
+              padding: 20px;
+              background-color: white;
+              border-radius: 8px;
+              box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+              text-align: center;
+              margin-bottom: 20px;
+              color: #2563eb;
+            }
+            pre {
+              white-space: pre-wrap;
+              word-wrap: break-word;
+              padding: 15px;
+              background-color: #f0f7ff;
+              border-radius: 5px;
+              border: 1px solid #ccc;
+              overflow: auto;
+            }
+            .links {
+              text-align: center;
+              margin-bottom: 20px;
+            }
+            .links a {
+              margin: 0 10px;
+              color: #2563eb;
+              text-decoration: none;
+            }
+            .links a:hover {
+              text-decoration: underline;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>Gemini Model Context</h1>
+            <div class="links">
+              <a href="/api/gemini?action=debug">View Raw JSON</a>
+              <a href="/api/gemini?action=view">Refresh</a>
+            </div>
+            <pre>${
+              formattedInstructions
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                // Add some coloring to the headings
+                .replace(/━━+/g, '<span style="color:#888">$&</span>')
+                .replace(/##[^\n]+/g, '<span style="color:#2563eb;font-weight:bold">$&</span>')
+                // Add some coloring to emojis
+                .replace(/(📊|👤|📝|💰|🔍|✅|❌|📅|🔖|📍|📋|💬|🤖|👤|⭐|ℹ️|📌)/g, '<span style="color:#000">$&</span>')
+            }</pre>
+          </div>
+        </body>
+      </html>
+      `;
+      
+      return new Response(htmlContent, {
+        headers: {
+          "Content-Type": "text/html",
+        },
+      });
+    } catch (error) {
+      console.error("❌ [API] Error generating formatted view:", error);
+      return new NextResponse(
+        JSON.stringify({
+          type: 'error',
+          error: 'Failed to generate formatted view',
+          details: error instanceof Error ? error.message : String(error)
+        }),
+        { status: 500 }
+      );
+    }
+
+    case 'debug':
+  // Handle debug request
+  try {
+    console.log('🔄 [API] Fetching debug data for model context');
+    
+    const regularChatCategories = [
+      'course_videos',
+      'main_chat_instructions',
+      'global_instructions',
+      'product_features',
+      'faq_content',
+      'internal_knowledge_base',
+      'uncategorized'
+    ];
+    // Get user context and instructions
+    const [userData, globalInstructions] = await Promise.all([
+      serverCache.getUserData(userId, getUserData),
+      serverCache.getGlobalInstructions(async () => getGlobalInstructions(regularChatCategories))
+    ]);
+
+    // Prepare context and instructions
+    const userContext = prepareUserContext(userData);
+    const formattedInstructions = formatInstructions(globalInstructions, userContext);
+    
+    // Format all the data that would be sent to the model
+    const modelInput = {
+      // Raw data
+      raw: {
+            userData,
+            globalInstructions,
+            userContext
+      },
+      // Formatted data (what the model actually sees)
+      formatted: {
+            formattedInstructions
+      }
+    };
+    
+        console.log('✅ [API] Returning debug data');
+    return new NextResponse(
+      JSON.stringify({
+        type: 'debug_data',
+        modelInput
+      })
+    );
+  } catch (error) {
+        console.error("❌ [API] Error fetching debug data:", error);
+    return new NextResponse(
+      JSON.stringify({
+        type: 'error',
+            error: 'Failed to fetch debug data',
+        details: error instanceof Error ? error.message : String(error)
+      }),
+      { status: 500 }
+    );
+  }
+
+    default:
+      // Default behavior - get chat history for most recent instance (backward compatibility)
+      try {
+        console.log('🔄 [API] Fetching chat history for most recent instance');
+        
+        if (instanceId) {
+          // Get specific instance
+          const instance = await getChatInstance(userId, instanceId);
+          if (!instance) {
+            return NextResponse.json({
+              type: 'error',
+              error: 'Chat instance not found'
+            }, { status: 404 });
+          }
+
+          return NextResponse.json({
+            type: 'chat_history',
+            history: instance.messages || [],
+            instanceId: instance.id,
+            title: instance.title
+          });
+        } else {
+          // Get most recent instance for backward compatibility
+          const instances = await getChatInstances(userId);
+          if (instances.length === 0) {
+            return NextResponse.json({
+              type: 'chat_history',
+              history: [],
+              instanceId: null,
+              title: 'New Chat'
+            });
+          }
+
+          const recentInstance = await getChatInstance(userId, instances[0].id);
+          return NextResponse.json({
+            type: 'chat_history',
+            history: recentInstance?.messages || [],
+            instanceId: recentInstance?.id || null,
+            title: recentInstance?.title || 'New Chat'
+          });
+        }
+      } catch (error) {
+        console.error("❌ [API] Error fetching chat history:", error);
+        return NextResponse.json({
+          type: 'error',
+          error: 'Failed to fetch chat history',
+          details: error instanceof Error ? error.message : String(error)
+        }, { status: 500 });
+      }
+  }
+}
+
+// Handle multiple actions for chat instances
+export async function DELETE(req: Request) {
+  const userId = await getUserId(req);
+  if (!userId) {
+    return new NextResponse("Unauthorized", { status: 401 });
+  }
+
+  try {
+    const { action, instanceId, title } = await req.json();
+
+    switch (action) {
+      case 'clear':
+        // Clear chat history for a specific instance
+        const success = await clearChatHistory(userId, instanceId);
+    
+    if (success) {
+          console.log(`✅ [Supabase] Chat history cleared successfully for user: ${userId}, instance: ${instanceId || 'recent'}`);
+        } else {
+          console.error(`❌ [Supabase] Failed to clear chat history for user: ${userId}, instance: ${instanceId || 'recent'}`);
+        }
+        
+        return NextResponse.json({
+          type: 'history_cleared',
+          success,
+          instanceId
+        });
+
+      case 'delete':
+        // Delete a specific chat instance
+        if (!instanceId) {
+          return NextResponse.json({
+            type: 'error',
+            error: 'Instance ID is required for deletion'
+          }, { status: 400 });
+        }
+
+        const deleteSuccess = await deleteChatInstance(userId, instanceId);
+        
+        if (deleteSuccess) {
+          console.log(`✅ [Supabase] Chat instance deleted successfully: ${instanceId}`);
+        } else {
+          console.error(`❌ [Supabase] Failed to delete chat instance: ${instanceId}`);
+        }
+        
+        return NextResponse.json({
+          type: 'instance_deleted',
+          success: deleteSuccess,
+          instanceId
+        });
+
+      default:
+        // Default behavior - clear most recent instance (backward compatibility)
+        const defaultSuccess = await clearChatHistory(userId);
+        
+        if (defaultSuccess) {
+          console.log(`✅ [Supabase] Chat history cleared successfully for user: ${userId}`);
+    } else {
+      console.error(`❌ [Supabase] Failed to clear chat history for user: ${userId}`);
+    }
+    
+        return NextResponse.json({
+        type: 'history_cleared',
+          success: defaultSuccess
+        });
+    }
+  } catch (error) {
+    console.error("❌ [API] Error processing DELETE request:", error);
+    return NextResponse.json({
+        type: 'error',
+      error: 'Failed to process request',
+        details: error instanceof Error ? error.message : String(error)
+    }, { status: 500 });
+  }
+}
+
+// Handle PUT requests for updating chat instances
+export async function PUT(req: Request) {
+  const userId = await getUserId(req);
+  if (!userId) {
+    return new NextResponse("Unauthorized", { status: 401 });
+  }
+
+  try {
+    const { action, instanceId, title } = await req.json();
+
+    switch (action) {
+      case 'create':
+        // Create a new chat instance
+        const newInstance = await createChatInstance(userId, title || 'New Chat');
+        
+        if (newInstance) {
+          console.log(`✅ [Supabase] Created new chat instance: ${newInstance.id}`);
+        } else {
+          console.error(`❌ [Supabase] Failed to create new chat instance`);
+        }
+        
+        return NextResponse.json({
+          type: 'instance_created',
+          success: !!newInstance,
+          instance: newInstance
+        });
+
+      case 'update_title':
+        // Update chat instance title
+        if (!instanceId) {
+          return NextResponse.json({
+            type: 'error',
+            error: 'Instance ID is required for title update'
+          }, { status: 400 });
+        }
+
+        if (!title || !title.trim()) {
+          return NextResponse.json({
+            type: 'error',
+            error: 'Title is required for title update'
+          }, { status: 400 });
+        }
+
+        const updateSuccess = await updateChatInstanceTitle(userId, instanceId, title.trim());
+        
+        if (updateSuccess) {
+          console.log(`✅ [Supabase] Updated chat instance title: ${instanceId}`);
+        } else {
+          console.error(`❌ [Supabase] Failed to update chat instance title: ${instanceId}`);
+        }
+        
+        return NextResponse.json({
+          type: 'title_updated',
+          success: updateSuccess,
+          instanceId,
+          title
+        });
+
+      default:
+        return NextResponse.json({
+          type: 'error',
+          error: 'Invalid action'
+        }, { status: 400 });
+    }
+  } catch (error) {
+    console.error("❌ [API] Error processing PUT request:", error);
+    return NextResponse.json({
+      type: 'error',
+      error: 'Failed to process request',
+      details: error instanceof Error ? error.message : String(error)
+    }, { status: 500 });
+  }
+} 

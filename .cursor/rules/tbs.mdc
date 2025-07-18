@@ -1,0 +1,11 @@
+---
+<<<<<<< HEAD
+description: 
+globs: 
+alwaysApply: true
+=======
+description:
+globs:
+alwaysApply: false
+>>>>>>> 07a932c910494f776eec651bd1a2a65681669a0a
+---
